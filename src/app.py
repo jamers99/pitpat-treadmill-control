@@ -12,6 +12,60 @@ from .logger import setup_logger
 # frames come back in the same metric units.
 KM_PER_MILE = 1.609344
 
+# Outputs shared by the connect and interval callbacks, as
+# keyword -> (component id, prop). The Output list and _create_output()'s
+# no_update defaults are both derived from this, so they cannot drift apart.
+SHARED_OUTPUTS = {
+    "btn_connect_text": ("button-connect", "children"),
+    "btn_connect_color": ("button-connect", "color"),
+    "input_disabled": ("text-input", "disabled"),
+    "variant_select_disabled": ("variant-select", "disabled"),
+    "speed": ("speed", "children"),
+    "distance": ("distance", "children"),
+    "calories": ("calories", "children"),
+    "steps": ("steps", "children"),
+    "duration": ("duration", "children"),
+    "status": ("status", "children"),
+    "alert_open": ("alert", "is_open"),
+    "alert_text": ("alert", "children"),
+    "alert_color": ("alert", "color"),
+    "btn_start_text": ("button-start", "children"),
+    "btn_start_disabled": ("button-start", "disabled"),
+    "btn_stop_disabled": ("button-stop", "disabled"),
+    "btn_speed_down_disabled": ("button-speed-down", "disabled"),
+    "btn_speed_up_disabled": ("button-speed-up", "disabled"),
+    "btn_set_speed_disabled": ("button-set-speed", "disabled"),
+    "speed_input_disabled": ("speed-input", "disabled"),
+    "speed_input_unit": ("speed-input-unit", "children"),
+    "table_body": ("table-data", "children"),
+    "connection_state": ("connection-state", "data"),
+    "running_state": ("running-state", "data"),
+    "interval_disabled": ("interval-component", "disabled"),
+    "last_address": ("last-address", "data"),
+}
+
+# _create_output() kwargs that switch every run control off.
+CONTROLS_OFF = {
+    "btn_start_disabled": True,
+    "btn_stop_disabled": True,
+    "btn_speed_down_disabled": True,
+    "btn_speed_up_disabled": True,
+    "btn_set_speed_disabled": True,
+    "speed_input_disabled": True,
+}
+
+# The run controls, in the order they appear in the layout.
+RUN_CONTROLS = (
+    "button-start", "button-stop", "button-speed-down",
+    "button-speed-up", "button-set-speed", "speed-input",
+)
+
+
+def _busy(after, controls=RUN_CONTROLS):
+    """`running=` spec disabling `controls` while a callback works, then setting them to `after`."""
+    return [[Output(cid, "disabled"), True, after] for cid in controls]
+
+
 class TreadmillApp:
     """Main application class for PitPat Treadmill Control."""
     
@@ -159,6 +213,13 @@ class TreadmillApp:
         """Unit flag for outgoing commands, driven off the last status frame."""
         return not self._is_imperial()
 
+    def _nudge_speed(self, step: float, running_state: int) -> None:
+        """Steps the target speed by `step` in whatever unit the display is using."""
+        if self.manager and self.treadmill_data and running_state == 1:
+            current = self._to_display_speed(self.treadmill_data.current_speed)
+            target_speed = self._to_wire_speed(max(current + step, 0))
+            self.manager.send_data(TreadmillController.set_speed(target_speed, is_kph=self._is_kph()))
+
     def _on_disconnect(self, device_address: str) -> None:
         """Handle Bluetooth disconnection."""
         self.logger.info(f"Disconnected from {device_address}")
@@ -174,67 +235,19 @@ class TreadmillApp:
 
     def _create_output(self, **kwargs) -> Tuple:
         """Create callback output tuple with default no_update values."""
-        defaults = {
-            "btn_connect_text": no_update,
-            "btn_connect_color": no_update,
-            "input_disabled": no_update,
-            "variant_select_disabled": no_update,
-            "speed": no_update,
-            "distance": no_update,
-            "calories": no_update,
-            "steps": no_update,
-            "duration": no_update,
-            "status": no_update,
-            "alert_open": no_update,
-            "alert_text": no_update,
-            "alert_color": no_update,
-            "btn_start_text": no_update,
-            "btn_start_disabled": no_update,
-            "btn_stop_disabled": no_update,
-            "btn_speed_down_disabled": no_update,
-            "btn_speed_up_disabled": no_update,
-            "btn_set_speed_disabled": no_update,
-            "speed_input_disabled": no_update,
-            "speed_input_unit": no_update,
-            "table_body": no_update,
-            "connection_state": no_update,
-            "running_state": no_update,
-            "interval_disabled": no_update,
-            "last_address": no_update,
-        }
-        defaults.update(kwargs)
-        return tuple(defaults.values())
+        unknown = set(kwargs) - set(SHARED_OUTPUTS)
+        if unknown:
+            raise KeyError(f"Unknown callback output(s): {sorted(unknown)}")
+        return tuple(kwargs.get(key, no_update) for key in SHARED_OUTPUTS)
 
     def _register_callbacks(self) -> None:
         """Register all Dash callbacks."""
         outputs = [
-            Output("button-connect", "children", allow_duplicate=True),
-            Output("button-connect", "color", allow_duplicate=True),
-            Output("text-input", "disabled", allow_duplicate=True),
-            Output("variant-select", "disabled", allow_duplicate=True),
-            Output("speed", "children", allow_duplicate=True),
-            Output("distance", "children", allow_duplicate=True),
-            Output("calories", "children", allow_duplicate=True),
-            Output("steps", "children", allow_duplicate=True),
-            Output("duration", "children", allow_duplicate=True),
-            Output("status", "children", allow_duplicate=True),
-            Output("alert", "is_open", allow_duplicate=True),
-            Output("alert", "children", allow_duplicate=True),
-            Output("alert", "color", allow_duplicate=True),
-            Output("button-start", "children", allow_duplicate=True),
-            Output("button-start", "disabled", allow_duplicate=True),
-            Output("button-stop", "disabled", allow_duplicate=True),
-            Output("button-speed-down", "disabled", allow_duplicate=True),
-            Output("button-speed-up", "disabled", allow_duplicate=True),
-            Output("button-set-speed", "disabled", allow_duplicate=True),
-            Output("speed-input", "disabled", allow_duplicate=True),
-            Output("speed-input-unit", "children", allow_duplicate=True),
-            Output("table-data", "children", allow_duplicate=True),
-            Output("connection-state", "data", allow_duplicate=True),
-            Output("running-state", "data", allow_duplicate=True),
-            Output("interval-component", "disabled", allow_duplicate=True),
-            Output("last-address", "data", allow_duplicate=True),
+            Output(cid, prop, allow_duplicate=True) for cid, prop in SHARED_OUTPUTS.values()
         ]
+        # Stop is left alone by the speed callbacks: they only run while the
+        # treadmill is running, and Stop is not offered in that state anyway.
+        speed_busy = _busy(False, [c for c in RUN_CONTROLS if c != "button-stop"])
 
         @self.app.callback(
             [
@@ -304,13 +317,7 @@ class TreadmillApp:
                 [Output("button-scan", "disabled"), True, False],
                 [Output("text-input", "disabled"), True, False],
                 [Output("variant-select", "disabled"), True, False],
-                [Output("button-start", "disabled"), True, no_update],
-                [Output("button-stop", "disabled"), True, no_update],
-                [Output("button-speed-down", "disabled"), True, no_update],
-                [Output("button-speed-up", "disabled"), True, no_update],
-                [Output("button-set-speed", "disabled"), True, no_update],
-                [Output("speed-input", "disabled"), True, no_update],
-            ],
+            ] + _busy(no_update),
             prevent_initial_call=True
         )
         def handle_connect(n_clicks: int, connection_state: str, device_address: str, variant: str) -> Tuple:
@@ -350,15 +357,10 @@ class TreadmillApp:
                     btn_connect_color="danger",
                     input_disabled=True,
                     variant_select_disabled=True,
-                    btn_start_disabled=True,
-                    btn_stop_disabled=True,
-                    btn_speed_down_disabled=True,
-                    btn_speed_up_disabled=True,
-                    btn_set_speed_disabled=True,
-                    speed_input_disabled=True,
                     alert_open=False,
                     interval_disabled=False,
-                    last_address=device_address
+                    last_address=device_address,
+                    **CONTROLS_OFF
                 )
 
             elif connection_state == "connected" and self.manager:
@@ -379,14 +381,9 @@ class TreadmillApp:
                     btn_connect_color="primary",
                     input_disabled=False,
                     variant_select_disabled=False,
-                    btn_start_disabled=True,
-                    btn_stop_disabled=True,
-                    btn_speed_down_disabled=True,
-                    btn_speed_up_disabled=True,
-                    btn_set_speed_disabled=True,
-                    speed_input_disabled=True,
                     alert_open=False,
-                    interval_disabled=True
+                    interval_disabled=True,
+                    **CONTROLS_OFF
                 )
 
             return self._create_output()
@@ -412,51 +409,46 @@ class TreadmillApp:
                     alert_color="danger",
                     input_disabled=False,
                     variant_select_disabled=False,
-                    btn_start_disabled=True,
-                    btn_speed_down_disabled=True,
-                    btn_speed_up_disabled=True,
-                    btn_set_speed_disabled=True,
-                    speed_input_disabled=True,
-                    interval_disabled=True
+                    interval_disabled=True,
+                    **CONTROLS_OFF
                 )
-            
-            if self.treadmill_data:
-                unit_mode = {0: "Metric", 1: "Imperial"}.get(self.treadmill_data.unit_mode, "N/A")
-                speed_unit = {0: "kph", 1: "mph"}.get(self.treadmill_data.unit_mode, "kph")
-                distance_unit = {0: "km", 1: "mi"}.get(self.treadmill_data.unit_mode, "km")
-                
-                speed = f"{self._to_display_speed(self.treadmill_data.current_speed):.1f} {speed_unit}"
-                distance = f"{self._to_display_distance(self.treadmill_data.distance):.2f} {distance_unit}"
-                calories = f"{self.treadmill_data.calories} kcal"
-                steps = f"{self.treadmill_data.real_electricity_steps}"
-                duration = f"{self.treadmill_data.duration_seconds:.1f} s"
-                status = {0: "Starting", 1: "Running", 2: "Paused", 3: "Stopped"}.get(self.treadmill_data.running_state, "N/A")
+
+            data = self.treadmill_data
+            if data:
+                imperial = data.unit_mode == 1
+                speed_unit = "mph" if imperial else "kph"
+                distance_unit = "mi" if imperial else "km"
+
+                speed = f"{self._to_display_speed(data.current_speed):.1f} {speed_unit}"
+                distance = f"{self._to_display_distance(data.distance):.2f} {distance_unit}"
+                calories = f"{data.calories} kcal"
+                steps = str(data.real_electricity_steps)
+                duration = f"{data.duration_seconds:.1f} s"
+                status = {0: "Starting", 1: "Running", 2: "Paused", 3: "Stopped"}.get(data.running_state, "N/A")
 
                 table_data = [
-                    ("Cycle ID", f"{self.treadmill_data.cycle_id}"),
-                    ("Running State", f"{status}"),
-                    ("Current Speed", f"{self._to_display_speed(self.treadmill_data.current_speed):.1f} {speed_unit}"),
-                    ("Target Speed", f"{self._to_display_speed(self.treadmill_data.target_speed):.1f} {speed_unit}"),
-                    ("Maximum Speed", f"{self._to_display_speed(self.treadmill_data.max_speed):.1f} {speed_unit}"),
-                    ("Current Incline", f"{self.treadmill_data.current_incline:.1f} °"),
-                    ("Target Incline", f"{self.treadmill_data.target_incline:.1f} °"),
-                    ("Maximum Incline", f"{self.treadmill_data.max_incline:.1f} °"),
-                    ("Heart Rate", f"{self.treadmill_data.heart_rate} bpm"),
-                    ("Distance", f"{self._to_display_distance(self.treadmill_data.distance):.2f} {distance_unit}"),
-                    ("Steps", f"{self.treadmill_data.real_electricity_steps}"),
-                    ("Calories", f"{self.treadmill_data.calories} kcal"),
-                    ("Duration", f"{timedelta(seconds=self.treadmill_data.duration_seconds)}"),
-                    ("WIFI Connected", f"{self.treadmill_data.is_connected}"),
-                    ("Motor Rotation Speed", f"{self.treadmill_data.real_rotate} rpm"),
-                    ("Motor Load", f"{self.treadmill_data.real_electricity} %"),
-                    ("Serial Number", f"{self.treadmill_data.serial_number}"),
-                    ("Firmware Version", f"{self.treadmill_data.firmware_version}"),
-                    ("Device Type", f"{self.treadmill_data.device_type}"),
-                    ("Unit Mode", f"{unit_mode}"),
+                    ("Cycle ID", str(data.cycle_id)),
+                    ("Running State", status),
+                    ("Current Speed", speed),
+                    ("Target Speed", f"{self._to_display_speed(data.target_speed):.1f} {speed_unit}"),
+                    ("Maximum Speed", f"{self._to_display_speed(data.max_speed):.1f} {speed_unit}"),
+                    ("Current Incline", f"{data.current_incline:.1f} °"),
+                    ("Target Incline", f"{data.target_incline:.1f} °"),
+                    ("Maximum Incline", f"{data.max_incline:.1f} °"),
+                    ("Heart Rate", f"{data.heart_rate} bpm"),
+                    ("Distance", distance),
+                    ("Steps", steps),
+                    ("Calories", calories),
+                    ("Duration", f"{timedelta(seconds=data.duration_seconds)}"),
+                    ("WIFI Connected", str(data.is_connected)),
+                    ("Motor Rotation Speed", f"{data.real_rotate} rpm"),
+                    ("Motor Load", f"{data.real_electricity} %"),
+                    ("Serial Number", str(data.serial_number)),
+                    ("Firmware Version", str(data.firmware_version)),
+                    ("Device Type", str(data.device_type)),
+                    ("Unit Mode", "Imperial" if imperial else "Metric"),
                 ]
-                
-                new_running_state = self.treadmill_data.running_state if self.treadmill_data.running_state != running_state else no_update
-                
+
                 return self._create_output(
                     speed_input_unit=speed_unit,
                     speed=speed,
@@ -465,10 +457,10 @@ class TreadmillApp:
                     steps=steps,
                     duration=duration,
                     status=status,
-                    running_state=new_running_state,
+                    running_state=data.running_state if data.running_state != running_state else no_update,
                     table_body=self._create_table_body(table_data)
                 )
-            
+
             return self._create_output()
 
         @self.app.callback(
@@ -488,29 +480,20 @@ class TreadmillApp:
             """Update control button states based on running state."""
             # The speed entry follows the same rule as the +/- buttons: the
             # treadmill only accepts a new target while it is running.
-            if not self.manager:
-                return "Start", True, True, True, True, True, True
-
+            all_off = ("Start", True, True, True, True, True, True)
             states = {
-                0: ("Start", True, True, True, True, True, True),  # Starting
+                0: all_off,  # Starting
                 1: ("Pause", False, True, False, False, False, False),  # Running
                 2: ("Start", False, False, True, True, True, True),  # Paused
-                3: ("Start", False, True, True, True, True, True)  # Stopped
+                3: ("Start", False, True, True, True, True, True),  # Stopped
             }
-            return states.get(running_state, ("Start", True, True, True, True, True, True))
+            return states.get(running_state, all_off) if self.manager else all_off
 
         @self.app.callback(
             [],
             [Input("button-start", "n_clicks")],
             [State("running-state", "data")],
-            running=[
-                [Output("button-start", "disabled"), True, True],
-                [Output("button-stop", "disabled"), True, True],
-                [Output("button-speed-down", "disabled"), True, True],
-                [Output("button-speed-up", "disabled"), True, True],
-                [Output("button-set-speed", "disabled"), True, True],
-                [Output("speed-input", "disabled"), True, True],
-            ],
+            running=_busy(True),
             prevent_initial_call=True
         )
         def handle_start(n_clicks: int, running_state: int) -> None:
@@ -526,14 +509,7 @@ class TreadmillApp:
             [],
             [Input("button-stop", "n_clicks")],
             [State("running-state", "data")],
-            running=[
-                [Output("button-start", "disabled"), True, True],
-                [Output("button-stop", "disabled"), True, True],
-                [Output("button-speed-down", "disabled"), True, True],
-                [Output("button-speed-up", "disabled"), True, True],
-                [Output("button-set-speed", "disabled"), True, True],
-                [Output("speed-input", "disabled"), True, True],
-            ],
+            running=_busy(True),
             prevent_initial_call=True
         )
         def handle_stop(n_clicks: int, running_state: int) -> None:
@@ -546,13 +522,7 @@ class TreadmillApp:
             [],
             [Input("button-set-speed", "n_clicks")],
             [State("speed-input", "value"), State("running-state", "data")],
-            running=[
-                [Output("button-start", "disabled"), True, False],
-                [Output("button-speed-down", "disabled"), True, False],
-                [Output("button-speed-up", "disabled"), True, False],
-                [Output("button-set-speed", "disabled"), True, False],
-                [Output("speed-input", "disabled"), True, False],
-            ],
+            running=speed_busy,
             prevent_initial_call=True
         )
         def handle_set_speed(n_clicks: int, speed: Optional[float], running_state: int) -> None:
@@ -584,43 +554,25 @@ class TreadmillApp:
             [],
             [Input("button-speed-up", "n_clicks")],
             [State("running-state", "data")],
-            running=[
-                [Output("button-start", "disabled"), True, False],
-                [Output("button-speed-down", "disabled"), True, False],
-                [Output("button-speed-up", "disabled"), True, False],
-                [Output("button-set-speed", "disabled"), True, False],
-                [Output("speed-input", "disabled"), True, False],
-            ],
+            running=speed_busy,
             prevent_initial_call=True
         )
         def handle_speed_up(n_clicks: int, running_state: int) -> None:
             """Handle speed up button clicks."""
             self.logger.info("Speed Up button clicked")
-            if self.manager and self.treadmill_data and running_state == 1:
-                # A 0.1 step in whatever unit the display is using.
-                target_speed = self._to_wire_speed(self._to_display_speed(self.treadmill_data.current_speed) + 0.1)
-                self.manager.send_data(TreadmillController.set_speed(target_speed, is_kph=self._is_kph()))
+            self._nudge_speed(0.1, running_state)
 
         @self.app.callback(
             [],
             [Input("button-speed-down", "n_clicks")],
             [State("running-state", "data")],
-            running=[
-                [Output("button-start", "disabled"), True, False],
-                [Output("button-speed-down", "disabled"), True, False],
-                [Output("button-speed-up", "disabled"), True, False],
-                [Output("button-set-speed", "disabled"), True, False],
-                [Output("speed-input", "disabled"), True, False],
-            ],
+            running=speed_busy,
             prevent_initial_call=True
         )
         def handle_speed_down(n_clicks: int, running_state: int) -> None:
             """Handle speed down button clicks."""
             self.logger.info("Speed Down button clicked")
-            if self.manager and self.treadmill_data and running_state == 1:
-                # A 0.1 step in whatever unit the display is using.
-                target_speed = self._to_wire_speed(max(self._to_display_speed(self.treadmill_data.current_speed) - 0.1, 0))
-                self.manager.send_data(TreadmillController.set_speed(target_speed, is_kph=self._is_kph()))
+            self._nudge_speed(-0.1, running_state)
 
     def run(self) -> None:
         """Run the Dash application."""

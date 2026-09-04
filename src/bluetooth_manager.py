@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from contextlib import asynccontextmanager
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from threading import Thread, Lock, Event
@@ -63,23 +64,28 @@ async def _scan_for_treadmills(timeout: float):
     return found
 
 
-async def _bluez_devices():
+@asynccontextmanager
+async def _bluez_interface(path: str, interface: str):
     """
-    BlueZ's known devices as {path, address, name, uuids, connected} dicts.
+    Yields the named D-Bus interface of a BlueZ object, closing the bus after.
 
-    Empty if the D-Bus system bus or BlueZ is unavailable.
+    dbus_fast is imported lazily because it is a Linux-only dependency.
     """
     from dbus_fast.aio import MessageBus
     from dbus_fast.constants import BusType
 
     bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
     try:
-        introspection = await bus.introspect("org.bluez", "/")
-        proxy = bus.get_proxy_object("org.bluez", "/", introspection)
-        manager = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
-        objects = await manager.call_get_managed_objects()
+        introspection = await bus.introspect("org.bluez", path)
+        yield bus.get_proxy_object("org.bluez", path, introspection).get_interface(interface)
     finally:
         bus.disconnect()
+
+
+async def _bluez_devices():
+    """BlueZ's known devices as {path, address, name, uuids, connected} dicts."""
+    async with _bluez_interface("/", "org.freedesktop.DBus.ObjectManager") as manager:
+        objects = await manager.call_get_managed_objects()
 
     devices = []
     for path, interfaces in objects.items():
@@ -159,10 +165,7 @@ class BluetoothManager:
         """
         Initializes the BluetoothManager.
 
-        :param device_address: Address of the Bluetooth device.
         :param variant: Key into VARIANTS selecting the GATT UUIDs and wrapper mode.
-        :param on_disconnect: Callback function invoked upon disconnection.
-        :param on_receive: Callback function invoked upon receiving data.
         """
         self.device_address = device_address
         config = VARIANTS[variant]
@@ -197,11 +200,7 @@ class BluetoothManager:
             logging.error(f"Event loop stopped with exception: {e}")
 
     def run_coroutine(self, coro):
-        """
-        Schedules a coroutine to be run on the event loop.
-
-        :param coro: The coroutine to execute.
-        """
+        """Schedules a coroutine to be run on the event loop."""
         asyncio.run_coroutine_threadsafe(coro, self.loop)
 
     async def _release_stale_link(self) -> bool:
@@ -228,25 +227,13 @@ class BluetoothManager:
             f"{self.device_address} is already connected at the BlueZ level; "
             "dropping that link so it advertises again."
         )
-        from dbus_fast.aio import MessageBus
-        from dbus_fast.constants import BusType
-
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        try:
-            introspection = await bus.introspect("org.bluez", device["path"])
-            proxy = bus.get_proxy_object("org.bluez", device["path"], introspection)
-            await proxy.get_interface("org.bluez.Device1").call_disconnect()
-        finally:
-            bus.disconnect()
+        async with _bluez_interface(device["path"], "org.bluez.Device1") as dev:
+            await dev.call_disconnect()
         await asyncio.sleep(2)
         return True
 
     def connect(self) -> bool:
-        """
-        Connects to the Bluetooth device and starts notifications.
-
-        :return: True if connected successfully, False otherwise.
-        """
+        """Connects to the Bluetooth device and starts notifications."""
         try:
             asyncio.run_coroutine_threadsafe(self._release_stale_link(), self.loop).result()
             future = asyncio.run_coroutine_threadsafe(self.client.connect(), self.loop)
@@ -265,11 +252,7 @@ class BluetoothManager:
             return False
 
     def disconnect(self) -> bool:
-        """
-        Disconnects from the Bluetooth device.
-
-        :return: True if disconnected successfully, False otherwise.
-        """
+        """Disconnects from the Bluetooth device."""
         try:
             if self.client.is_connected:
                 self.run_coroutine(self.client.stop_notify(self.notify_uuid))
@@ -290,31 +273,14 @@ class BluetoothManager:
             logging.error(f"Unexpected error during disconnection: {e}")
             return False
 
-    def is_connected(self) -> bool:
-        """
-        Checks if the Bluetooth device is connected.
-
-        :return: True if connected, False otherwise.
-        """
-        return self.client.is_connected
-
     def _handle_disconnection(self, client):
-        """
-        Handles unexpected disconnections.
-
-        :param client: The BleakClient instance.
-        """
+        """Handles unexpected disconnections."""
         logging.warning(f"Device {self.device_address} disconnected unexpectedly.")
         if self.on_disconnect:
             self.loop.call_soon_threadsafe(self.on_disconnect, self.device_address)
 
     def _notification_handler(self, sender: str, data: bytearray):
-        """
-        Handles incoming notifications from the BLE device.
-
-        :param sender: The UUID of the characteristic sending the notification.
-        :param data: The data received.
-        """
+        """Handles incoming notifications from the BLE device."""
         logging.info(f"Notification from {sender}: {data.hex()}")
         parsed_data = TreadmillData(data[4:] if self.wrapped else data)
         if self.on_receive:
@@ -331,19 +297,12 @@ class BluetoothManager:
         return bytes.fromhex("4d00") + bytes([counter, len(body) & 0xFF]) + body
 
     def send_heartbeat(self):
-        """Sends a heartbeat signal to the BLE device."""
+        """Sends the queued command if there is one, otherwise a plain status poll."""
         try:
             with self.pending_lock:
-                request = self.pending_request
-                self.pending_request = None
-                if request:
-                    data_to_send = self._wrap(request.data)
-                    logging.info(f"Preparing to send pending data: {data_to_send.hex()}")
-                    self.run_coroutine(self._write_data_and_set_request(data_to_send, request))
-                else:
-                    heartbeat_data = self._wrap(bytes.fromhex(HEARTBEAT_PACKET))
-                    logging.debug(f"Preparing to send heartbeat: {heartbeat_data.hex()}")
-                    self.run_coroutine(self._write_heartbeat(heartbeat_data))
+                request, self.pending_request = self.pending_request, None
+            data = self._wrap(request.data if request else bytes.fromhex(HEARTBEAT_PACKET))
+            self.run_coroutine(self._write(data, request))
         except Exception as e:
             logging.error(f"Error during heartbeat preparation: {e}")
 
@@ -351,12 +310,8 @@ class BluetoothManager:
         """
         Sends data to the BLE device via the next heartbeat.
 
-        Instead of sending data immediately, it queues the data to be sent when a heartbeat occurs.
-        If multiple send_data() calls are made before the heartbeat sends data, only the latest data is sent.
-
-        :param data: The data bytes to send.
-        :param timeout: Maximum time to wait for the data to be sent.
-        :return: True if data was sent successfully, False otherwise.
+        Queued rather than sent immediately, and only the latest queued data is
+        sent if several calls land before the next heartbeat.
         """
         request = self.SendDataRequest(data)
         with self.pending_lock:
@@ -378,39 +333,18 @@ class BluetoothManager:
             logging.error("Timeout waiting for data to be sent.")
             return False
 
-    async def _write_data_and_set_request(self, data: bytes, request):
-        """
-        Asynchronously writes the specified data to the BLE characteristic and sets the request's status.
-
-        :param data: Data bytes to send.
-        :param request: The SendDataRequest instance associated with this send.
-        """
+    async def _write(self, data: bytes, request=None):
+        """Writes to the control characteristic, completing `request` if one is waiting on it."""
         try:
             await self.client.write_gatt_char(self.write_uuid, data)
-            logging.info(f"Data sent: {data.hex()}")
-            request.success = True
-        except BleakError as e:
-            logging.error(f"BleakError while sending data: {e}")
-            request.success = False
+            logging.info(f"Sent: {data.hex()}")
+            if request:
+                request.success = True
         except Exception as e:
-            logging.error(f"Unexpected error while sending data: {e}")
-            request.success = False
+            logging.error(f"Error while sending {data.hex()}: {e}")
         finally:
-            request.event.set()
-
-    async def _write_heartbeat(self, data: bytes):
-        """
-        Asynchronously writes the heartbeat data to the BLE characteristic.
-
-        :param data: Heartbeat data as bytes.
-        """
-        try:
-            await self.client.write_gatt_char(self.write_uuid, data)
-            logging.info(f"Heartbeat sent: {data.hex()}")
-        except BleakError as e:
-            logging.error(f"BleakError while sending heartbeat: {e}")
-        except Exception as e:
-            logging.error(f"Unexpected error while sending heartbeat: {e}")
+            if request:
+                request.event.set()
 
     def shutdown(self):
         """Shuts down the BluetoothManager, ensuring all resources are cleaned up."""
