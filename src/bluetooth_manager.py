@@ -1,19 +1,153 @@
 import asyncio
 import logging
-from bleak import BleakClient
+from contextlib import asynccontextmanager
+from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from threading import Thread, Lock, Event
 
 from .treadmill_data import TreadmillData
 
-# Constants
-NOTIFY_CHAR_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
-WRITE_CHAR_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
-HEARTBEAT_HEAD = "4d00"
-HEARTBEAT_BODY = "056a05fdf843"
+# Known hardware revisions (docs/FIRMWARE-VARIANT.md). "wrapped" means writes
+# need the "4d00 <counter> <length>" transport wrapper and status frames need
+# their leading 4 bytes stripped; the fba0 variant takes everything bare.
+VARIANTS = {
+    "ba04": {
+        "label": "PitPat T01 (BA04) — original",
+        "notify_uuid": "0000ff02-0000-1000-8000-00805f9b34fb",
+        "write_uuid": "0000ff01-0000-1000-8000-00805f9b34fb",
+        "wrapped": True,
+    },
+    "fba0": {
+        "label": "PitPat T01, firmware 37 (fba0 variant)",
+        "notify_uuid": "0000fba2-0000-1000-8000-00805f9b34fb",
+        "write_uuid": "0000fba1-0000-1000-8000-00805f9b34fb",
+        "wrapped": False,
+    },
+}
+DEFAULT_VARIANT = "fba0"
+# Unwrapped status-poll ("heartbeat") packet; wrapped variants add the
+# transport header around this same body in BluetoothManager._wrap().
+HEARTBEAT_PACKET = "6a05fdf843"
+
+# Vendor GATT services a PitPat treadmill advertises: `fba0` on the firmware-37
+# variant, the `ff00` family on the BA04 revision (docs/FIRMWARE-VARIANT.md §1).
+# `1910` is advertised too but is a generic-looking service, so it only counts
+# as a hint alongside the name.
+VENDOR_SERVICE_UUIDS = {
+    "0000fba0-0000-1000-8000-00805f9b34fb",
+    "0000ff00-0000-1000-8000-00805f9b34fb",
+}
+NAME_HINTS = ("pitpat", "t01")
+DISCOVERY_TIMEOUT = 8.0
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _looks_like_treadmill(name: str, service_uuids) -> bool:
+    """True if the advertisement matches a known service or name hint."""
+    uuids = {str(u).lower() for u in (service_uuids or [])}
+    if uuids & VENDOR_SERVICE_UUIDS:
+        return True
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in NAME_HINTS)
+
+
+async def _scan_for_treadmills(timeout: float):
+    """Scans for advertising treadmills. Returns (address, name, rssi) tuples."""
+    found = []
+    devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    for device, adv in devices.values():
+        name = adv.local_name or device.name or ""
+        if _looks_like_treadmill(name, adv.service_uuids):
+            found.append((device.address, name or "Unknown", adv.rssi))
+    return found
+
+
+@asynccontextmanager
+async def _bluez_interface(path: str, interface: str):
+    """
+    Yields the named D-Bus interface of a BlueZ object, closing the bus after.
+
+    dbus_fast is imported lazily because it is a Linux-only dependency.
+    """
+    from dbus_fast.aio import MessageBus
+    from dbus_fast.constants import BusType
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        introspection = await bus.introspect("org.bluez", path)
+        yield bus.get_proxy_object("org.bluez", path, introspection).get_interface(interface)
+    finally:
+        bus.disconnect()
+
+
+async def _bluez_devices():
+    """BlueZ's known devices as {path, address, name, uuids, connected} dicts."""
+    async with _bluez_interface("/", "org.freedesktop.DBus.ObjectManager") as manager:
+        objects = await manager.call_get_managed_objects()
+
+    devices = []
+    for path, interfaces in objects.items():
+        props = interfaces.get("org.bluez.Device1")
+        if not props or "Address" not in props:
+            continue
+        devices.append({
+            "path": path,
+            "address": props["Address"].value,
+            "name": props["Name"].value if "Name" in props else "",
+            "uuids": props["UUIDs"].value if "UUIDs" in props else [],
+            "connected": bool(props["Connected"].value) if "Connected" in props else False,
+        })
+    return devices
+
+
+async def _known_bluez_treadmills():
+    """
+    Treadmills BlueZ already knows about, advertising or not.
+
+    A BLE peripheral goes silent while something holds a connection to it, so a
+    treadmill left connected by the desktop Bluetooth panel never shows up in a
+    scan. BlueZ still has the object, and connect() drops the stale link
+    afterwards, so surface those here too.
+    """
+    try:
+        devices = await _bluez_devices()
+    except Exception as e:
+        logging.debug(f"Could not list known BlueZ devices: {e}")
+        return []
+    return [
+        (d["address"], d["name"] or "Unknown", None)
+        for d in devices
+        if _looks_like_treadmill(d["name"], d["uuids"])
+    ]
+
+
+async def _discover(timeout: float):
+    """Collects treadmills from a fresh scan plus BlueZ's known devices."""
+    results = {}
+    for address, name, rssi in await _scan_for_treadmills(timeout) + await _known_bluez_treadmills():
+        key = address.upper()
+        # A scan result carries an RSSI, so it wins over the cached BlueZ entry.
+        if key not in results or (rssi is not None and results[key][2] is None):
+            results[key] = (address, name, rssi)
+    return sorted(results.values(), key=lambda d: (d[2] is None, -(d[2] or 0)))
+
+
+def discover_treadmills(timeout: float = DISCOVERY_TIMEOUT):
+    """
+    Finds nearby PitPat treadmills, so the address never has to be typed.
+
+    Blocks for up to `timeout` seconds and runs its own event loop, so it is
+    safe to call before a BluetoothManager exists.
+    """
+    try:
+        devices = asyncio.run(_discover(timeout))
+        logging.info(f"Discovery found {len(devices)} treadmill(s): {devices}")
+        return devices
+    except Exception as e:
+        logging.error(f"Error during device discovery: {e}")
+        return []
 
 
 class BluetoothManager:
@@ -27,18 +161,21 @@ class BluetoothManager:
             self.event = Event()
             self.success = False
 
-    def __init__(self, device_address: str, on_disconnect=None, on_receive=None):
+    def __init__(self, device_address: str, variant: str = DEFAULT_VARIANT, on_disconnect=None, on_receive=None):
         """
         Initializes the BluetoothManager.
 
-        :param device_address: Address of the Bluetooth device.
-        :param on_disconnect: Callback function invoked upon disconnection.
-        :param on_receive: Callback function invoked upon receiving data.
+        :param variant: Key into VARIANTS selecting the GATT UUIDs and wrapper mode.
         """
         self.device_address = device_address
+        config = VARIANTS[variant]
+        self.notify_uuid = config["notify_uuid"]
+        self.write_uuid = config["write_uuid"]
+        self.wrapped = config["wrapped"]
         self.on_disconnect = on_disconnect
         self.on_receive = on_receive
 
+        # Transport wrapper counter, only used when self.wrapped.
         self.heartbeat_counter = 0
         self.counter_lock = Lock()
 
@@ -63,25 +200,47 @@ class BluetoothManager:
             logging.error(f"Event loop stopped with exception: {e}")
 
     def run_coroutine(self, coro):
-        """
-        Schedules a coroutine to be run on the event loop.
-
-        :param coro: The coroutine to execute.
-        """
+        """Schedules a coroutine to be run on the event loop."""
         asyncio.run_coroutine_threadsafe(coro, self.loop)
 
-    def connect(self) -> bool:
+    async def _release_stale_link(self) -> bool:
         """
-        Connects to the Bluetooth device and starts notifications.
+        Disconnects any pre-existing BlueZ connection to the device.
 
-        :return: True if connected successfully, False otherwise.
+        A BLE peripheral stops advertising while connected, so if something else
+        (the system Bluetooth panel, a previous session) holds the link, bleak's
+        scan cannot find it and connect() fails with "was not found". Dropping
+        that link makes the device advertise again.
         """
         try:
+            devices = await _bluez_devices()
+        except Exception as e:
+            logging.warning(f"Could not check for a stale BlueZ link: {e}")
+            return False
+
+        target = self.device_address.upper()
+        device = next((d for d in devices if d["address"].upper() == target), None)
+        if not device or not device["connected"]:
+            return False
+
+        logging.warning(
+            f"{self.device_address} is already connected at the BlueZ level; "
+            "dropping that link so it advertises again."
+        )
+        async with _bluez_interface(device["path"], "org.bluez.Device1") as dev:
+            await dev.call_disconnect()
+        await asyncio.sleep(2)
+        return True
+
+    def connect(self) -> bool:
+        """Connects to the Bluetooth device and starts notifications."""
+        try:
+            asyncio.run_coroutine_threadsafe(self._release_stale_link(), self.loop).result()
             future = asyncio.run_coroutine_threadsafe(self.client.connect(), self.loop)
             success = future.result()
             if success and self.client.is_connected:
                 logging.info(f"Connected to {self.device_address}")
-                self.run_coroutine(self.client.start_notify(NOTIFY_CHAR_UUID, self._notification_handler))
+                self.run_coroutine(self.client.start_notify(self.notify_uuid, self._notification_handler))
             else:
                 logging.error(f"Failed to connect to {self.device_address}")
             return self.client.is_connected
@@ -93,14 +252,10 @@ class BluetoothManager:
             return False
 
     def disconnect(self) -> bool:
-        """
-        Disconnects from the Bluetooth device.
-
-        :return: True if disconnected successfully, False otherwise.
-        """
+        """Disconnects from the Bluetooth device."""
         try:
             if self.client.is_connected:
-                self.run_coroutine(self.client.stop_notify(NOTIFY_CHAR_UUID))
+                self.run_coroutine(self.client.stop_notify(self.notify_uuid))
                 future = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
                 success = future.result()
                 if success:
@@ -118,64 +273,36 @@ class BluetoothManager:
             logging.error(f"Unexpected error during disconnection: {e}")
             return False
 
-    def is_connected(self) -> bool:
-        """
-        Checks if the Bluetooth device is connected.
-
-        :return: True if connected, False otherwise.
-        """
-        return self.client.is_connected
-
     def _handle_disconnection(self, client):
-        """
-        Handles unexpected disconnections.
-
-        :param client: The BleakClient instance.
-        """
+        """Handles unexpected disconnections."""
         logging.warning(f"Device {self.device_address} disconnected unexpectedly.")
         if self.on_disconnect:
             self.loop.call_soon_threadsafe(self.on_disconnect, self.device_address)
 
     def _notification_handler(self, sender: str, data: bytearray):
-        """
-        Handles incoming notifications from the BLE device.
-
-        :param sender: The UUID of the characteristic sending the notification.
-        :param data: The data received.
-        """
+        """Handles incoming notifications from the BLE device."""
         logging.info(f"Notification from {sender}: {data.hex()}")
-        parsed_data = TreadmillData(data[4:])
+        parsed_data = TreadmillData(data[4:] if self.wrapped else data)
         if self.on_receive:
             self.loop.call_soon_threadsafe(self.on_receive, parsed_data)
         self.send_heartbeat()
 
-    def send_heartbeat(self):
-        """Sends a heartbeat signal to the BLE device."""
-        try:
-            with self.counter_lock:
-                current_counter = self.heartbeat_counter
-                self.heartbeat_counter = (self.heartbeat_counter + 1) % 256  # Ensures it stays within byte range
+    def _wrap(self, body: bytes) -> bytes:
+        """Adds the "4d00 <counter> <length>" transport header, if this variant needs one."""
+        if not self.wrapped:
+            return body
+        with self.counter_lock:
+            counter = self.heartbeat_counter
+            self.heartbeat_counter = (self.heartbeat_counter + 1) % 256
+        return bytes.fromhex("4d00") + bytes([counter, len(body) & 0xFF]) + body
 
+    def send_heartbeat(self):
+        """Sends the queued command if there is one, otherwise a plain status poll."""
+        try:
             with self.pending_lock:
-                request = self.pending_request
-                self.pending_request = None
-                if request:
-                    data_to_send = (
-                        bytes.fromhex(HEARTBEAT_HEAD) + 
-                        bytes([(current_counter & 0xFF)]) + 
-                        bytes([(len(request.data) & 0xFF)]) + 
-                        request.data
-                    )
-                    logging.info(f"Preparing to send pending data: {data_to_send.hex()}")
-                    self.run_coroutine(self._write_data_and_set_request(data_to_send, request))
-                else:
-                    heartbeat_data = (
-                        bytes.fromhex(HEARTBEAT_HEAD) + 
-                        bytes([(current_counter & 0xFF)]) + 
-                        bytes.fromhex(HEARTBEAT_BODY)
-                    )
-                    logging.info(f"Preparing to send heartbeat: {heartbeat_data.hex()}")
-                    self.run_coroutine(self._write_heartbeat(heartbeat_data))
+                request, self.pending_request = self.pending_request, None
+            data = self._wrap(request.data if request else bytes.fromhex(HEARTBEAT_PACKET))
+            self.run_coroutine(self._write(data, request))
         except Exception as e:
             logging.error(f"Error during heartbeat preparation: {e}")
 
@@ -183,12 +310,8 @@ class BluetoothManager:
         """
         Sends data to the BLE device via the next heartbeat.
 
-        Instead of sending data immediately, it queues the data to be sent when a heartbeat occurs.
-        If multiple send_data() calls are made before the heartbeat sends data, only the latest data is sent.
-
-        :param data: The data bytes to send.
-        :param timeout: Maximum time to wait for the data to be sent.
-        :return: True if data was sent successfully, False otherwise.
+        Queued rather than sent immediately, and only the latest queued data is
+        sent if several calls land before the next heartbeat.
         """
         request = self.SendDataRequest(data)
         with self.pending_lock:
@@ -210,39 +333,18 @@ class BluetoothManager:
             logging.error("Timeout waiting for data to be sent.")
             return False
 
-    async def _write_data_and_set_request(self, data: bytes, request):
-        """
-        Asynchronously writes the specified data to the BLE characteristic and sets the request's status.
-
-        :param data: Data bytes to send.
-        :param request: The SendDataRequest instance associated with this send.
-        """
+    async def _write(self, data: bytes, request=None):
+        """Writes to the control characteristic, completing `request` if one is waiting on it."""
         try:
-            await self.client.write_gatt_char(WRITE_CHAR_UUID, data)
-            logging.info(f"Data sent: {data.hex()}")
-            request.success = True
-        except BleakError as e:
-            logging.error(f"BleakError while sending data: {e}")
-            request.success = False
+            await self.client.write_gatt_char(self.write_uuid, data)
+            logging.info(f"Sent: {data.hex()}")
+            if request:
+                request.success = True
         except Exception as e:
-            logging.error(f"Unexpected error while sending data: {e}")
-            request.success = False
+            logging.error(f"Error while sending {data.hex()}: {e}")
         finally:
-            request.event.set()
-
-    async def _write_heartbeat(self, data: bytes):
-        """
-        Asynchronously writes the heartbeat data to the BLE characteristic.
-
-        :param data: Heartbeat data as bytes.
-        """
-        try:
-            await self.client.write_gatt_char(WRITE_CHAR_UUID, data)
-            logging.info(f"Heartbeat sent: {data.hex()}")
-        except BleakError as e:
-            logging.error(f"BleakError while sending heartbeat: {e}")
-        except Exception as e:
-            logging.error(f"Unexpected error while sending heartbeat: {e}")
+            if request:
+                request.event.set()
 
     def shutdown(self):
         """Shuts down the BluetoothManager, ensuring all resources are cleaned up."""

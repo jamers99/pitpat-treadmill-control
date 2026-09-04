@@ -1,3 +1,6 @@
 dash==3.0.1
 dash-bootstrap-components==2.0.0
 bleak==0.22.3
+# Imported directly for stale-link release and BlueZ device discovery
+# (also a bleak dependency on Linux).
+dbus-fast>=1.83.0,<3
