@@ -126,44 +126,23 @@ class TreadmillApp:
         return bool(self.treadmill_data and self.treadmill_data.unit_mode == 1)
 
     def _to_display_speed(self, wire_speed: int) -> float:
-        """
-        Converts a wire speed to the unit the treadmill's display uses.
-
-        :param wire_speed: Speed in thousandths of a kph, as sent and reported.
-        :return: Speed in kph, or mph when the treadmill is in imperial mode.
-        """
+        """Converts a wire speed (thousandths of a kph) to the display unit."""
         speed = wire_speed / 1000
         return speed / KM_PER_MILE if self._is_imperial() else speed
 
     def _to_wire_speed(self, display_speed: float) -> int:
-        """
-        Converts a speed the user sees into the value the treadmill expects.
-
-        :param display_speed: Speed in kph, or mph in imperial mode.
-        :return: Speed in thousandths of a kph.
-        """
+        """Converts a displayed speed to thousandths of a kph for the wire."""
         if self._is_imperial():
             display_speed = display_speed * KM_PER_MILE
         return int(round(display_speed * 1000))
 
     def _to_display_distance(self, wire_distance: int) -> float:
-        """
-        Converts a wire distance to the unit the treadmill's display uses.
-
-        :param wire_distance: Distance in metres, as reported.
-        :return: Distance in km, or miles when the treadmill is in imperial mode.
-        """
+        """Converts a wire distance (metres) to the display unit."""
         distance = wire_distance / 1000
         return distance / KM_PER_MILE if self._is_imperial() else distance
 
     def _is_kph(self) -> bool:
-        """
-        Unit flag to stamp on outgoing commands.
-
-        The command's unit bit has to agree with the mode the treadmill is
-        actually reporting, so drive it off the last status frame rather than
-        assuming metric.
-        """
+        """Unit flag for outgoing commands, driven off the last status frame."""
         return not self._is_imperial()
 
     def _on_disconnect(self, device_address: str) -> None:

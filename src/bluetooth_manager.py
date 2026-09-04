@@ -30,13 +30,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 def _looks_like_treadmill(name: str, service_uuids) -> bool:
-    """
-    Decides whether an advertisement belongs to a PitPat treadmill.
-
-    :param name: Advertised (or cached) device name, may be empty.
-    :param service_uuids: Iterable of advertised service UUID strings.
-    :return: True if the device matches a known service or name hint.
-    """
+    """True if the advertisement matches a known service or name hint."""
     uuids = {str(u).lower() for u in (service_uuids or [])}
     if uuids & VENDOR_SERVICE_UUIDS:
         return True
@@ -45,12 +39,7 @@ def _looks_like_treadmill(name: str, service_uuids) -> bool:
 
 
 async def _scan_for_treadmills(timeout: float):
-    """
-    Scans for advertising treadmills.
-
-    :param timeout: Scan duration in seconds.
-    :return: List of (address, name, rssi) tuples.
-    """
+    """Scans for advertising treadmills. Returns (address, name, rssi) tuples."""
     found = []
     devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
     for device, adv in devices.values():
@@ -60,52 +49,62 @@ async def _scan_for_treadmills(timeout: float):
     return found
 
 
+async def _bluez_devices():
+    """
+    BlueZ's known devices as {path, address, name, uuids, connected} dicts.
+
+    Empty if the D-Bus system bus or BlueZ is unavailable.
+    """
+    from dbus_fast.aio import MessageBus
+    from dbus_fast.constants import BusType
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    try:
+        introspection = await bus.introspect("org.bluez", "/")
+        proxy = bus.get_proxy_object("org.bluez", "/", introspection)
+        manager = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
+        objects = await manager.call_get_managed_objects()
+    finally:
+        bus.disconnect()
+
+    devices = []
+    for path, interfaces in objects.items():
+        props = interfaces.get("org.bluez.Device1")
+        if not props or "Address" not in props:
+            continue
+        devices.append({
+            "path": path,
+            "address": props["Address"].value,
+            "name": props["Name"].value if "Name" in props else "",
+            "uuids": props["UUIDs"].value if "UUIDs" in props else [],
+            "connected": bool(props["Connected"].value) if "Connected" in props else False,
+        })
+    return devices
+
+
 async def _known_bluez_treadmills():
     """
-    Lists treadmills BlueZ already knows about, advertising or not.
+    Treadmills BlueZ already knows about, advertising or not.
 
     A BLE peripheral goes silent while something holds a connection to it, so a
     treadmill left connected by the desktop Bluetooth panel never shows up in a
     scan. BlueZ still has the object, and connect() drops the stale link
     afterwards, so surface those here too.
-
-    :return: List of (address, name, None) tuples; empty if BlueZ is unavailable.
     """
     try:
-        from dbus_fast.aio import MessageBus
-        from dbus_fast.constants import BusType
-
-        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-        try:
-            introspection = await bus.introspect("org.bluez", "/")
-            proxy = bus.get_proxy_object("org.bluez", "/", introspection)
-            manager = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
-            objects = await manager.call_get_managed_objects()
-
-            found = []
-            for interfaces in objects.values():
-                props = interfaces.get("org.bluez.Device1")
-                if not props or "Address" not in props:
-                    continue
-                name = props["Name"].value if "Name" in props else ""
-                uuids = props["UUIDs"].value if "UUIDs" in props else []
-                if _looks_like_treadmill(name, uuids):
-                    found.append((props["Address"].value, name or "Unknown", None))
-            return found
-        finally:
-            bus.disconnect()
+        devices = await _bluez_devices()
     except Exception as e:
         logging.debug(f"Could not list known BlueZ devices: {e}")
         return []
+    return [
+        (d["address"], d["name"] or "Unknown", None)
+        for d in devices
+        if _looks_like_treadmill(d["name"], d["uuids"])
+    ]
 
 
 async def _discover(timeout: float):
-    """
-    Collects treadmills from a fresh scan plus BlueZ's known devices.
-
-    :param timeout: Scan duration in seconds.
-    :return: List of (address, name, rssi) tuples, strongest signal first.
-    """
+    """Collects treadmills from a fresh scan plus BlueZ's known devices."""
     results = {}
     for address, name, rssi in await _scan_for_treadmills(timeout) + await _known_bluez_treadmills():
         key = address.upper()
@@ -119,11 +118,8 @@ def discover_treadmills(timeout: float = DISCOVERY_TIMEOUT):
     """
     Finds nearby PitPat treadmills, so the address never has to be typed.
 
-    Blocks for up to `timeout` seconds and runs its own event loop, so it is safe
-    to call before a BluetoothManager exists.
-
-    :param timeout: Scan duration in seconds.
-    :return: List of (address, name, rssi) tuples, strongest signal first.
+    Blocks for up to `timeout` seconds and runs its own event loop, so it is
+    safe to call before a BluetoothManager exists.
     """
     try:
         devices = asyncio.run(_discover(timeout))
@@ -193,49 +189,34 @@ class BluetoothManager:
         (the system Bluetooth panel, a previous session) holds the link, bleak's
         scan cannot find it and connect() fails with "was not found". Dropping
         that link makes the device advertise again.
-
-        :return: True if an existing connection was dropped, False otherwise.
         """
         try:
-            from dbus_fast.aio import MessageBus
-            from dbus_fast.constants import BusType
-
-            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
-            try:
-                introspection = await bus.introspect("org.bluez", "/")
-                proxy = bus.get_proxy_object("org.bluez", "/", introspection)
-                manager = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
-                objects = await manager.call_get_managed_objects()
-
-                target = self.device_address.upper()
-                for path, interfaces in objects.items():
-                    props = interfaces.get("org.bluez.Device1")
-                    if not props:
-                        continue
-                    address = props.get("Address")
-                    connected = props.get("Connected")
-                    if not address or address.value.upper() != target:
-                        continue
-                    if not (connected and connected.value):
-                        return False
-
-                    logging.warning(
-                        f"{self.device_address} is already connected at the BlueZ level; "
-                        "dropping that link so it advertises again."
-                    )
-                    dev_introspection = await bus.introspect("org.bluez", path)
-                    device = bus.get_proxy_object(
-                        "org.bluez", path, dev_introspection
-                    ).get_interface("org.bluez.Device1")
-                    await device.call_disconnect()
-                    await asyncio.sleep(2)
-                    return True
-                return False
-            finally:
-                bus.disconnect()
+            devices = await _bluez_devices()
         except Exception as e:
             logging.warning(f"Could not check for a stale BlueZ link: {e}")
             return False
+
+        target = self.device_address.upper()
+        device = next((d for d in devices if d["address"].upper() == target), None)
+        if not device or not device["connected"]:
+            return False
+
+        logging.warning(
+            f"{self.device_address} is already connected at the BlueZ level; "
+            "dropping that link so it advertises again."
+        )
+        from dbus_fast.aio import MessageBus
+        from dbus_fast.constants import BusType
+
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            introspection = await bus.introspect("org.bluez", device["path"])
+            proxy = bus.get_proxy_object("org.bluez", device["path"], introspection)
+            await proxy.get_interface("org.bluez.Device1").call_disconnect()
+        finally:
+            bus.disconnect()
+        await asyncio.sleep(2)
+        return True
 
     def connect(self) -> bool:
         """

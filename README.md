@@ -99,19 +99,12 @@ Access the dashboard at `http://localhost:8050`.
 
 ## Finding Your Treadmill
 
-The dashboard scans for treadmills automatically when the page loads, and the **Scan**
-button next to the address field repeats the scan on demand. A scan takes about 8
-seconds.
-
-- If exactly one treadmill is found, its address is filled in for you — just press
-  **Connect**.
-- If several are found, click the address field to pick one from the suggestion list.
-- The address field still accepts a manually typed address.
-
-Devices are matched on their advertised vendor service (`fba0` or the `ff00` family) or
-on a name containing "PitPat" or "T01". On Linux, treadmills BlueZ already knows about
-are listed too, even when a stale connection is stopping them from advertising —
-connecting drops that link first.
+The dashboard scans automatically on page load (~8s), and the **Scan** button repeats
+it on demand. One match fills in the address for you; several show as suggestions in
+the address field, which also still accepts manual entry. Devices are matched by
+advertised vendor service (`fba0` or `ff00` family) or a name containing "PitPat" or
+"T01". On Linux, treadmills BlueZ already knows about are listed too, even mid-stale-
+connection — connecting drops that link first.
 
 ---
 
@@ -162,10 +155,9 @@ The following commands can be sent to the treadmill:
 The following treadmill models have been tested with this application.
 
 - Pitpat T01 (BA04)
-- Pitpat T01, firmware 37 (`fba0` service variant) — **requires the patches described in
-  [docs/FIRMWARE-VARIANT.md](docs/FIRMWARE-VARIANT.md).** Different GATT characteristics and
-  no transport wrapper; on an unpatched checkout it connects but shows no data and the
-  control buttons silently do nothing.
+- Pitpat T01, firmware 37 (`fba0` service variant) — see
+  [docs/FIRMWARE-VARIANT.md](docs/FIRMWARE-VARIANT.md). Note: this fork's patches for
+  the variant are currently unconditional, so this checkout does **not** support BA04.
 
 Help us expand this list by reporting your compatible devices via an [issue](https://github.com/azmke/pitpat-treadmill-control/issues) or pull request:
 
@@ -176,21 +168,13 @@ Help us expand this list by reporting your compatible devices via an [issue](htt
 ### Bluetooth Access
 - Ensure Bluetooth is enabled on the host system.
 - For Docker on Linux, mount the D-Bus system bus socket — `docker-compose.yml` already
-  does. bleak talks to the host's `bluetoothd` over D-Bus and never touches the HCI
-  device, so no `--privileged`, `--net=host`, or `CAP_NET_ADMIN` is needed:
-  ```bash
-  docker run -d -p 8050:8050 \
-    -v /run/dbus/system_bus_socket:/run/dbus/system_bus_socket \
-    pitpat-treadmill-control
-  ```
-  The same socket covers scanning; the container runs as root, which BlueZ's D-Bus
-  policy allows to call both `StartDiscovery` and the GATT interfaces.
-  (A `--device=/dev/rfcomm0` flag does nothing useful here — rfcomm is Bluetooth Classic
-  serial, whereas this app uses BLE GATT.)
-- Do not connect the treadmill from your desktop's Bluetooth panel. A BLE device stops
-  advertising while connected, which makes the app's scan fail with a misleading
-  `was not found`. Pairing is not required. See
-  [docs/FIRMWARE-VARIANT.md](docs/FIRMWARE-VARIANT.md#6-troubleshooting).
+  does. bleak talks to `bluetoothd` over D-Bus (never the HCI device directly), so no
+  `--privileged`, `--net=host`, or `CAP_NET_ADMIN` is needed, and the same socket covers
+  both scanning and the GATT link.
+- Don't connect the treadmill from your desktop's Bluetooth panel — a BLE device stops
+  advertising while connected, which makes the app's scan fail with a misleading `was
+  not found`. Pairing is not required. See
+  [docs/FIRMWARE-VARIANT.md](docs/FIRMWARE-VARIANT.md#troubleshooting).
 
 ### Logging
 - Logs are stored in the `logs/` directory (locally or within the container)
