@@ -158,8 +158,11 @@ The following treadmill models have been tested with this application.
 
 - Pitpat T01 (BA04)
 - Pitpat T01, firmware 37 (`fba0` service variant) — see
-  [docs/FIRMWARE-VARIANT.md](docs/FIRMWARE-VARIANT.md). Note: this fork's patches for
-  the variant are currently unconditional, so this checkout does **not** support BA04.
+  [docs/FIRMWARE-VARIANT.md](docs/FIRMWARE-VARIANT.md)
+
+Pick which one you have from the dropdown next to the address field before connecting.
+The choice, and the last address you connected to, are remembered in the browser
+(`localStorage`) so you don't have to set them again next time.
 
 Help us expand this list by reporting your compatible devices via an [issue](https://github.com/azmke/pitpat-treadmill-control/issues) or pull request:
 

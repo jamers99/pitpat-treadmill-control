@@ -6,12 +6,26 @@ from threading import Thread, Lock, Event
 
 from .treadmill_data import TreadmillData
 
-# Constants
-NOTIFY_CHAR_UUID = "0000fba2-0000-1000-8000-00805f9b34fb"
-WRITE_CHAR_UUID = "0000fba1-0000-1000-8000-00805f9b34fb"
-# This firmware takes bare packets: no "4d00 <counter> <length>" transport
-# wrapper in either direction. Wrapped writes are accepted at the ATT layer and
-# then silently discarded. Status-poll packet, unwrapped:
+# Known hardware revisions (docs/FIRMWARE-VARIANT.md). "wrapped" means writes
+# need the "4d00 <counter> <length>" transport wrapper and status frames need
+# their leading 4 bytes stripped; the fba0 variant takes everything bare.
+VARIANTS = {
+    "ba04": {
+        "label": "PitPat T01 (BA04) — original",
+        "notify_uuid": "0000ff02-0000-1000-8000-00805f9b34fb",
+        "write_uuid": "0000ff01-0000-1000-8000-00805f9b34fb",
+        "wrapped": True,
+    },
+    "fba0": {
+        "label": "PitPat T01, firmware 37 (fba0 variant)",
+        "notify_uuid": "0000fba2-0000-1000-8000-00805f9b34fb",
+        "write_uuid": "0000fba1-0000-1000-8000-00805f9b34fb",
+        "wrapped": False,
+    },
+}
+DEFAULT_VARIANT = "fba0"
+# Unwrapped status-poll ("heartbeat") packet; wrapped variants add the
+# transport header around this same body in BluetoothManager._wrap().
 HEARTBEAT_PACKET = "6a05fdf843"
 
 # Vendor GATT services a PitPat treadmill advertises: `fba0` on the firmware-37
@@ -141,17 +155,26 @@ class BluetoothManager:
             self.event = Event()
             self.success = False
 
-    def __init__(self, device_address: str, on_disconnect=None, on_receive=None):
+    def __init__(self, device_address: str, variant: str = DEFAULT_VARIANT, on_disconnect=None, on_receive=None):
         """
         Initializes the BluetoothManager.
 
         :param device_address: Address of the Bluetooth device.
+        :param variant: Key into VARIANTS selecting the GATT UUIDs and wrapper mode.
         :param on_disconnect: Callback function invoked upon disconnection.
         :param on_receive: Callback function invoked upon receiving data.
         """
         self.device_address = device_address
+        config = VARIANTS[variant]
+        self.notify_uuid = config["notify_uuid"]
+        self.write_uuid = config["write_uuid"]
+        self.wrapped = config["wrapped"]
         self.on_disconnect = on_disconnect
         self.on_receive = on_receive
+
+        # Transport wrapper counter, only used when self.wrapped.
+        self.heartbeat_counter = 0
+        self.counter_lock = Lock()
 
         # Pending data to be sent via send_data()
         self.pending_request = None
@@ -230,7 +253,7 @@ class BluetoothManager:
             success = future.result()
             if success and self.client.is_connected:
                 logging.info(f"Connected to {self.device_address}")
-                self.run_coroutine(self.client.start_notify(NOTIFY_CHAR_UUID, self._notification_handler))
+                self.run_coroutine(self.client.start_notify(self.notify_uuid, self._notification_handler))
             else:
                 logging.error(f"Failed to connect to {self.device_address}")
             return self.client.is_connected
@@ -249,7 +272,7 @@ class BluetoothManager:
         """
         try:
             if self.client.is_connected:
-                self.run_coroutine(self.client.stop_notify(NOTIFY_CHAR_UUID))
+                self.run_coroutine(self.client.stop_notify(self.notify_uuid))
                 future = asyncio.run_coroutine_threadsafe(self.client.disconnect(), self.loop)
                 success = future.result()
                 if success:
@@ -293,10 +316,19 @@ class BluetoothManager:
         :param data: The data received.
         """
         logging.info(f"Notification from {sender}: {data.hex()}")
-        parsed_data = TreadmillData(data)
+        parsed_data = TreadmillData(data[4:] if self.wrapped else data)
         if self.on_receive:
             self.loop.call_soon_threadsafe(self.on_receive, parsed_data)
         self.send_heartbeat()
+
+    def _wrap(self, body: bytes) -> bytes:
+        """Adds the "4d00 <counter> <length>" transport header, if this variant needs one."""
+        if not self.wrapped:
+            return body
+        with self.counter_lock:
+            counter = self.heartbeat_counter
+            self.heartbeat_counter = (self.heartbeat_counter + 1) % 256
+        return bytes.fromhex("4d00") + bytes([counter, len(body) & 0xFF]) + body
 
     def send_heartbeat(self):
         """Sends a heartbeat signal to the BLE device."""
@@ -305,11 +337,11 @@ class BluetoothManager:
                 request = self.pending_request
                 self.pending_request = None
                 if request:
-                    data_to_send = request.data
+                    data_to_send = self._wrap(request.data)
                     logging.info(f"Preparing to send pending data: {data_to_send.hex()}")
                     self.run_coroutine(self._write_data_and_set_request(data_to_send, request))
                 else:
-                    heartbeat_data = bytes.fromhex(HEARTBEAT_PACKET)
+                    heartbeat_data = self._wrap(bytes.fromhex(HEARTBEAT_PACKET))
                     logging.debug(f"Preparing to send heartbeat: {heartbeat_data.hex()}")
                     self.run_coroutine(self._write_heartbeat(heartbeat_data))
         except Exception as e:
@@ -354,7 +386,7 @@ class BluetoothManager:
         :param request: The SendDataRequest instance associated with this send.
         """
         try:
-            await self.client.write_gatt_char(WRITE_CHAR_UUID, data)
+            await self.client.write_gatt_char(self.write_uuid, data)
             logging.info(f"Data sent: {data.hex()}")
             request.success = True
         except BleakError as e:
@@ -373,7 +405,7 @@ class BluetoothManager:
         :param data: Heartbeat data as bytes.
         """
         try:
-            await self.client.write_gatt_char(WRITE_CHAR_UUID, data)
+            await self.client.write_gatt_char(self.write_uuid, data)
             logging.info(f"Heartbeat sent: {data.hex()}")
         except BleakError as e:
             logging.error(f"BleakError while sending heartbeat: {e}")

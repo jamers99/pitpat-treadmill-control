@@ -2,7 +2,7 @@ from typing import List, Tuple, Optional, Any
 from dash import Dash, html, dcc, Output, Input, State, no_update
 import dash_bootstrap_components as dbc
 from datetime import timedelta
-from .bluetooth_manager import BluetoothManager, discover_treadmills
+from .bluetooth_manager import BluetoothManager, VARIANTS, DEFAULT_VARIANT, discover_treadmills
 from .treadmill_controller import TreadmillController
 from .logger import setup_logger
 
@@ -57,12 +57,22 @@ class TreadmillApp:
                 dbc.Alert(id="alert", color="danger", dismissable=True, is_open=False),
                 dbc.InputGroup(
                     [
+                        dbc.Select(
+                            id="variant-select",
+                            options=[{"label": cfg["label"], "value": key} for key, cfg in VARIANTS.items()],
+                            value=DEFAULT_VARIANT,
+                            style={"maxWidth": "18rem"},
+                            persistence=True,
+                            persistence_type="local",
+                        ),
                         dbc.Input(
                             id="text-input",
                             type="text",
                             placeholder="Device Address",
                             list="device-list",
                             autoComplete="off",
+                            persistence=True,
+                            persistence_type="local",
                         ),
                         dbc.Button("Scan", id="button-scan", color="secondary", n_clicks=0),
                         dbc.Button("Connect", id="button-connect", color="primary", n_clicks=0),
@@ -115,6 +125,10 @@ class TreadmillApp:
                 dbc.Table(id="table-data", bordered=True, responsive=True, style={"tableLayout": "fixed"}),
                 dcc.Store(id="connection-state", data="disconnected"),
                 dcc.Store(id="running-state", data=-1),
+                # Address of the last treadmill connected to. Unlike the `persistence`
+                # prop on text-input, dcc.Store's storage_type survives that field's
+                # value also being a callback Output (see handle_scan/handle_connect).
+                dcc.Store(id="last-address", storage_type="local"),
                 dcc.Interval(id="interval-component", interval=1000, n_intervals=0, disabled=True),
                 # Fires once shortly after page load to scan without a click.
                 dcc.Interval(id="interval-scan", interval=500, n_intervals=0, max_intervals=1),
@@ -164,6 +178,7 @@ class TreadmillApp:
             "btn_connect_text": no_update,
             "btn_connect_color": no_update,
             "input_disabled": no_update,
+            "variant_select_disabled": no_update,
             "speed": no_update,
             "distance": no_update,
             "calories": no_update,
@@ -185,6 +200,7 @@ class TreadmillApp:
             "connection_state": no_update,
             "running_state": no_update,
             "interval_disabled": no_update,
+            "last_address": no_update,
         }
         defaults.update(kwargs)
         return tuple(defaults.values())
@@ -195,6 +211,7 @@ class TreadmillApp:
             Output("button-connect", "children", allow_duplicate=True),
             Output("button-connect", "color", allow_duplicate=True),
             Output("text-input", "disabled", allow_duplicate=True),
+            Output("variant-select", "disabled", allow_duplicate=True),
             Output("speed", "children", allow_duplicate=True),
             Output("distance", "children", allow_duplicate=True),
             Output("calories", "children", allow_duplicate=True),
@@ -216,6 +233,7 @@ class TreadmillApp:
             Output("connection-state", "data", allow_duplicate=True),
             Output("running-state", "data", allow_duplicate=True),
             Output("interval-component", "disabled", allow_duplicate=True),
+            Output("last-address", "data", allow_duplicate=True),
         ]
 
         @self.app.callback(
@@ -227,7 +245,7 @@ class TreadmillApp:
                 Output("alert", "color", allow_duplicate=True),
             ],
             [Input("button-scan", "n_clicks"), Input("interval-scan", "n_intervals")],
-            [State("connection-state", "data"), State("text-input", "value")],
+            [State("connection-state", "data"), State("text-input", "value"), State("last-address", "data")],
             running=[
                 [Output("button-scan", "children"), "Scanning...", "Scan"],
                 [Output("button-scan", "disabled"), True, False],
@@ -235,10 +253,19 @@ class TreadmillApp:
             ],
             prevent_initial_call=True
         )
-        def handle_scan(n_clicks: int, n_intervals: int, connection_state: str, device_address: str) -> Tuple:
+        def handle_scan(
+            n_clicks: int, n_intervals: int, connection_state: str, device_address: str, last_address: Optional[str]
+        ) -> Tuple:
             """Scan for nearby treadmills and offer them as address suggestions."""
             if connection_state == "connected":
                 return no_update, no_update, no_update, no_update, no_update
+
+            # Nothing typed yet: prefill the last treadmill connected to, so a
+            # reload doesn't lose it even though a scan may still overwrite the
+            # suggestion list below.
+            value = no_update
+            if not (device_address or "").strip() and last_address:
+                value = last_address
 
             self.logger.info("Scanning for treadmills")
             devices = discover_treadmills()
@@ -247,7 +274,7 @@ class TreadmillApp:
                 self.logger.warning("No treadmills found")
                 return (
                     [],
-                    no_update,
+                    value,
                     True,
                     "No treadmill found. Make sure it is powered on and not connected "
                     "elsewhere, then scan again.",
@@ -262,19 +289,21 @@ class TreadmillApp:
                 for address, name, rssi in devices
             ]
 
-            # One hit and nothing typed yet: fill it in so Connect just works.
-            value = devices[0][0] if len(devices) == 1 and not (device_address or "").strip() else no_update
+            # One hit and nothing filled in yet: fill it in so Connect just works.
+            if value is no_update and len(devices) == 1 and not (device_address or "").strip():
+                value = devices[0][0]
             self.logger.info(f"Found {len(devices)} treadmill(s)")
             return options, value, False, no_update, no_update
 
         @self.app.callback(
             outputs,
             [Input("button-connect", "n_clicks")],
-            [State("connection-state", "data"), State("text-input", "value")],
+            [State("connection-state", "data"), State("text-input", "value"), State("variant-select", "value")],
             running=[
                 [Output("button-connect", "disabled"), True, False],
                 [Output("button-scan", "disabled"), True, False],
                 [Output("text-input", "disabled"), True, False],
+                [Output("variant-select", "disabled"), True, False],
                 [Output("button-start", "disabled"), True, no_update],
                 [Output("button-stop", "disabled"), True, no_update],
                 [Output("button-speed-down", "disabled"), True, no_update],
@@ -284,10 +313,10 @@ class TreadmillApp:
             ],
             prevent_initial_call=True
         )
-        def handle_connect(n_clicks: int, connection_state: str, device_address: str) -> Tuple:
+        def handle_connect(n_clicks: int, connection_state: str, device_address: str, variant: str) -> Tuple:
             """Handle connect/disconnect button clicks."""
             self.logger.info("Connect/Disconnect button clicked")
-            
+
             if connection_state == "disconnected":
                 device_address = (device_address or "").strip()
                 if not device_address:
@@ -297,10 +326,15 @@ class TreadmillApp:
                         alert_text="Please provide a correct device address.",
                         alert_color="danger"
                     )
-                
-                self.manager = BluetoothManager(device_address, on_disconnect=self._on_disconnect, on_receive=self._on_receive)
+
+                self.manager = BluetoothManager(
+                    device_address,
+                    variant=variant or DEFAULT_VARIANT,
+                    on_disconnect=self._on_disconnect,
+                    on_receive=self._on_receive,
+                )
                 success = self.manager.connect()
-                
+
                 if not success:
                     self.logger.error(f"Failed to connect to {device_address}")
                     return self._create_output(
@@ -308,13 +342,14 @@ class TreadmillApp:
                         alert_text=f"Failed to connect to {device_address}. Check if the device address is correct!",
                         alert_color="danger"
                     )
-                
+
                 self.logger.info(f"Successfully connected to {device_address}")
                 return self._create_output(
                     connection_state="connected",
                     btn_connect_text="Disconnect",
                     btn_connect_color="danger",
                     input_disabled=True,
+                    variant_select_disabled=True,
                     btn_start_disabled=True,
                     btn_stop_disabled=True,
                     btn_speed_down_disabled=True,
@@ -322,12 +357,13 @@ class TreadmillApp:
                     btn_set_speed_disabled=True,
                     speed_input_disabled=True,
                     alert_open=False,
-                    interval_disabled=False
+                    interval_disabled=False,
+                    last_address=device_address
                 )
-            
+
             elif connection_state == "connected" and self.manager:
                 success = self.manager.disconnect()
-                
+
                 if not success:
                     self.logger.error(f"Failed to disconnect from {device_address}")
                     return self._create_output(
@@ -335,13 +371,14 @@ class TreadmillApp:
                         alert_text=f"Failed to disconnect from {device_address}",
                         alert_color="danger"
                     )
-                
+
                 self.logger.info(f"Successfully disconnected from {device_address}")
                 return self._create_output(
                     connection_state="disconnected",
                     btn_connect_text="Connect",
                     btn_connect_color="primary",
                     input_disabled=False,
+                    variant_select_disabled=False,
                     btn_start_disabled=True,
                     btn_stop_disabled=True,
                     btn_speed_down_disabled=True,
@@ -351,7 +388,7 @@ class TreadmillApp:
                     alert_open=False,
                     interval_disabled=True
                 )
-            
+
             return self._create_output()
 
         @self.app.callback(
@@ -374,6 +411,7 @@ class TreadmillApp:
                     alert_text=f"Disconnected from {device_address}. Please try to reconnect!",
                     alert_color="danger",
                     input_disabled=False,
+                    variant_select_disabled=False,
                     btn_start_disabled=True,
                     btn_speed_down_disabled=True,
                     btn_speed_up_disabled=True,

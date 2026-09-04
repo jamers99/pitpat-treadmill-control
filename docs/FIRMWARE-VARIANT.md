@@ -49,24 +49,24 @@ treadmill's own display.** `target_speed` is thousandths of a kph, `distance`
 is metres, both directions. Convert at the UI boundary
 (`_to_wire_speed`/`_to_display_speed` in `src/app.py`), not in the packet.
 
-Both changes are currently unconditional in `src/bluetooth_manager.py` —
-running this checkout against a BA04 unit will not work. Supporting both
-means probing for `fba0` vs. `ff00` at connect time and switching UUIDs/wrapper
-mode from that.
+`src/bluetooth_manager.py` selects between these two revisions via the
+`VARIANTS` dict, keyed `"ba04"` / `"fba0"`. The dashboard's variant dropdown
+(next to the address field) picks the key passed to `BluetoothManager(...)`,
+and is remembered in the browser (`localStorage`) between sessions along with
+the last address connected to.
 
-### Adapting this for BA04 (or another variant)
+### Adapting this for a third variant
 
-This checkout hardcodes the fba0 constants. To point it at a different
-device, hand a coding agent this file plus:
+To support hardware that differs from both entries in `VARIANTS`, hand a
+coding agent this file plus:
 
-1. `src/bluetooth_manager.py` — `NOTIFY_CHAR_UUID`, `WRITE_CHAR_UUID`,
-   `HEARTBEAT_PACKET`, and the `TreadmillData(data)` call in
-   `_notification_handler` (upstream needs `data[4:]`; add back the
-   `4d00 <counter> <length>` wrapper in `_write_data_and_set_request` /
-   `_write_heartbeat` if the target also needs it).
-2. Enumerate the device's GATT services/characteristics (§1 above shows the
-   `bleak` snippet) and diff against the tables in this doc to find what
-   actually differs.
+1. `src/bluetooth_manager.py` — add an entry to `VARIANTS` with the new
+   `notify_uuid`/`write_uuid` and whether it's `wrapped` (needs the
+   `4d00 <counter> <length>` transport header both ways). The dashboard's
+   dropdown is generated from this dict, so nothing else needs to change to
+   make it selectable.
+2. Enumerate the device's GATT services/characteristics (the `bleak` snippet
+   above) and diff against the tables in this doc to find what differs.
 3. Confirm with the XOR checksum: a correctly-unwrapped status frame has
    `checksum_valid = True`; a wrong offset or leftover wrapper byte flips it
    to `False` immediately, so there's no guessing.
