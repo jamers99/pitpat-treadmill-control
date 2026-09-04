@@ -1,0 +1,17 @@
+services:
+  pitpat:
+    build: .
+    image: pitpat-treadmill-control
+    container_name: pitpat
+    restart: unless-stopped
+    # Bound to the loopback address, so the dashboard is reachable from this
+    # machine only and never from the rest of the network.
+    ports:
+      - "127.0.0.1:8050:8050"
+    volumes:
+      # bleak talks to the host's bluetoothd over D-Bus — this socket is the
+      # only Bluetooth access needed, for both scanning and the GATT link.
+      # No --privileged, --net=host or CAP_NET_ADMIN.
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+      - ./logs:/app/logs
+    command: ["--host", "0.0.0.0", "--port", "8050"]

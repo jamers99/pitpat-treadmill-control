@@ -1,19 +1,137 @@
 import asyncio
 import logging
-from bleak import BleakClient
+from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 from threading import Thread, Lock, Event
 
 from .treadmill_data import TreadmillData
 
 # Constants
-NOTIFY_CHAR_UUID = "0000ff02-0000-1000-8000-00805f9b34fb"
-WRITE_CHAR_UUID = "0000ff01-0000-1000-8000-00805f9b34fb"
-HEARTBEAT_HEAD = "4d00"
-HEARTBEAT_BODY = "056a05fdf843"
+NOTIFY_CHAR_UUID = "0000fba2-0000-1000-8000-00805f9b34fb"
+WRITE_CHAR_UUID = "0000fba1-0000-1000-8000-00805f9b34fb"
+# This firmware takes bare packets: no "4d00 <counter> <length>" transport
+# wrapper in either direction. Wrapped writes are accepted at the ATT layer and
+# then silently discarded. Status-poll packet, unwrapped:
+HEARTBEAT_PACKET = "6a05fdf843"
+
+# Vendor GATT services a PitPat treadmill advertises: `fba0` on the firmware-37
+# variant, the `ff00` family on the BA04 revision (docs/FIRMWARE-VARIANT.md §1).
+# `1910` is advertised too but is a generic-looking service, so it only counts
+# as a hint alongside the name.
+VENDOR_SERVICE_UUIDS = {
+    "0000fba0-0000-1000-8000-00805f9b34fb",
+    "0000ff00-0000-1000-8000-00805f9b34fb",
+}
+NAME_HINTS = ("pitpat", "t01")
+DISCOVERY_TIMEOUT = 8.0
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+
+def _looks_like_treadmill(name: str, service_uuids) -> bool:
+    """
+    Decides whether an advertisement belongs to a PitPat treadmill.
+
+    :param name: Advertised (or cached) device name, may be empty.
+    :param service_uuids: Iterable of advertised service UUID strings.
+    :return: True if the device matches a known service or name hint.
+    """
+    uuids = {str(u).lower() for u in (service_uuids or [])}
+    if uuids & VENDOR_SERVICE_UUIDS:
+        return True
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in NAME_HINTS)
+
+
+async def _scan_for_treadmills(timeout: float):
+    """
+    Scans for advertising treadmills.
+
+    :param timeout: Scan duration in seconds.
+    :return: List of (address, name, rssi) tuples.
+    """
+    found = []
+    devices = await BleakScanner.discover(timeout=timeout, return_adv=True)
+    for device, adv in devices.values():
+        name = adv.local_name or device.name or ""
+        if _looks_like_treadmill(name, adv.service_uuids):
+            found.append((device.address, name or "Unknown", adv.rssi))
+    return found
+
+
+async def _known_bluez_treadmills():
+    """
+    Lists treadmills BlueZ already knows about, advertising or not.
+
+    A BLE peripheral goes silent while something holds a connection to it, so a
+    treadmill left connected by the desktop Bluetooth panel never shows up in a
+    scan. BlueZ still has the object, and connect() drops the stale link
+    afterwards, so surface those here too.
+
+    :return: List of (address, name, None) tuples; empty if BlueZ is unavailable.
+    """
+    try:
+        from dbus_fast.aio import MessageBus
+        from dbus_fast.constants import BusType
+
+        bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+        try:
+            introspection = await bus.introspect("org.bluez", "/")
+            proxy = bus.get_proxy_object("org.bluez", "/", introspection)
+            manager = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
+            objects = await manager.call_get_managed_objects()
+
+            found = []
+            for interfaces in objects.values():
+                props = interfaces.get("org.bluez.Device1")
+                if not props or "Address" not in props:
+                    continue
+                name = props["Name"].value if "Name" in props else ""
+                uuids = props["UUIDs"].value if "UUIDs" in props else []
+                if _looks_like_treadmill(name, uuids):
+                    found.append((props["Address"].value, name or "Unknown", None))
+            return found
+        finally:
+            bus.disconnect()
+    except Exception as e:
+        logging.debug(f"Could not list known BlueZ devices: {e}")
+        return []
+
+
+async def _discover(timeout: float):
+    """
+    Collects treadmills from a fresh scan plus BlueZ's known devices.
+
+    :param timeout: Scan duration in seconds.
+    :return: List of (address, name, rssi) tuples, strongest signal first.
+    """
+    results = {}
+    for address, name, rssi in await _scan_for_treadmills(timeout) + await _known_bluez_treadmills():
+        key = address.upper()
+        # A scan result carries an RSSI, so it wins over the cached BlueZ entry.
+        if key not in results or (rssi is not None and results[key][2] is None):
+            results[key] = (address, name, rssi)
+    return sorted(results.values(), key=lambda d: (d[2] is None, -(d[2] or 0)))
+
+
+def discover_treadmills(timeout: float = DISCOVERY_TIMEOUT):
+    """
+    Finds nearby PitPat treadmills, so the address never has to be typed.
+
+    Blocks for up to `timeout` seconds and runs its own event loop, so it is safe
+    to call before a BluetoothManager exists.
+
+    :param timeout: Scan duration in seconds.
+    :return: List of (address, name, rssi) tuples, strongest signal first.
+    """
+    try:
+        devices = asyncio.run(_discover(timeout))
+        logging.info(f"Discovery found {len(devices)} treadmill(s): {devices}")
+        return devices
+    except Exception as e:
+        logging.error(f"Error during device discovery: {e}")
+        return []
 
 
 class BluetoothManager:
@@ -38,9 +156,6 @@ class BluetoothManager:
         self.device_address = device_address
         self.on_disconnect = on_disconnect
         self.on_receive = on_receive
-
-        self.heartbeat_counter = 0
-        self.counter_lock = Lock()
 
         # Pending data to be sent via send_data()
         self.pending_request = None
@@ -70,6 +185,58 @@ class BluetoothManager:
         """
         asyncio.run_coroutine_threadsafe(coro, self.loop)
 
+    async def _release_stale_link(self) -> bool:
+        """
+        Disconnects any pre-existing BlueZ connection to the device.
+
+        A BLE peripheral stops advertising while connected, so if something else
+        (the system Bluetooth panel, a previous session) holds the link, bleak's
+        scan cannot find it and connect() fails with "was not found". Dropping
+        that link makes the device advertise again.
+
+        :return: True if an existing connection was dropped, False otherwise.
+        """
+        try:
+            from dbus_fast.aio import MessageBus
+            from dbus_fast.constants import BusType
+
+            bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+            try:
+                introspection = await bus.introspect("org.bluez", "/")
+                proxy = bus.get_proxy_object("org.bluez", "/", introspection)
+                manager = proxy.get_interface("org.freedesktop.DBus.ObjectManager")
+                objects = await manager.call_get_managed_objects()
+
+                target = self.device_address.upper()
+                for path, interfaces in objects.items():
+                    props = interfaces.get("org.bluez.Device1")
+                    if not props:
+                        continue
+                    address = props.get("Address")
+                    connected = props.get("Connected")
+                    if not address or address.value.upper() != target:
+                        continue
+                    if not (connected and connected.value):
+                        return False
+
+                    logging.warning(
+                        f"{self.device_address} is already connected at the BlueZ level; "
+                        "dropping that link so it advertises again."
+                    )
+                    dev_introspection = await bus.introspect("org.bluez", path)
+                    device = bus.get_proxy_object(
+                        "org.bluez", path, dev_introspection
+                    ).get_interface("org.bluez.Device1")
+                    await device.call_disconnect()
+                    await asyncio.sleep(2)
+                    return True
+                return False
+            finally:
+                bus.disconnect()
+        except Exception as e:
+            logging.warning(f"Could not check for a stale BlueZ link: {e}")
+            return False
+
     def connect(self) -> bool:
         """
         Connects to the Bluetooth device and starts notifications.
@@ -77,6 +244,7 @@ class BluetoothManager:
         :return: True if connected successfully, False otherwise.
         """
         try:
+            asyncio.run_coroutine_threadsafe(self._release_stale_link(), self.loop).result()
             future = asyncio.run_coroutine_threadsafe(self.client.connect(), self.loop)
             success = future.result()
             if success and self.client.is_connected:
@@ -144,7 +312,7 @@ class BluetoothManager:
         :param data: The data received.
         """
         logging.info(f"Notification from {sender}: {data.hex()}")
-        parsed_data = TreadmillData(data[4:])
+        parsed_data = TreadmillData(data)
         if self.on_receive:
             self.loop.call_soon_threadsafe(self.on_receive, parsed_data)
         self.send_heartbeat()
@@ -152,29 +320,16 @@ class BluetoothManager:
     def send_heartbeat(self):
         """Sends a heartbeat signal to the BLE device."""
         try:
-            with self.counter_lock:
-                current_counter = self.heartbeat_counter
-                self.heartbeat_counter = (self.heartbeat_counter + 1) % 256  # Ensures it stays within byte range
-
             with self.pending_lock:
                 request = self.pending_request
                 self.pending_request = None
                 if request:
-                    data_to_send = (
-                        bytes.fromhex(HEARTBEAT_HEAD) + 
-                        bytes([(current_counter & 0xFF)]) + 
-                        bytes([(len(request.data) & 0xFF)]) + 
-                        request.data
-                    )
+                    data_to_send = request.data
                     logging.info(f"Preparing to send pending data: {data_to_send.hex()}")
                     self.run_coroutine(self._write_data_and_set_request(data_to_send, request))
                 else:
-                    heartbeat_data = (
-                        bytes.fromhex(HEARTBEAT_HEAD) + 
-                        bytes([(current_counter & 0xFF)]) + 
-                        bytes.fromhex(HEARTBEAT_BODY)
-                    )
-                    logging.info(f"Preparing to send heartbeat: {heartbeat_data.hex()}")
+                    heartbeat_data = bytes.fromhex(HEARTBEAT_PACKET)
+                    logging.debug(f"Preparing to send heartbeat: {heartbeat_data.hex()}")
                     self.run_coroutine(self._write_heartbeat(heartbeat_data))
         except Exception as e:
             logging.error(f"Error during heartbeat preparation: {e}")

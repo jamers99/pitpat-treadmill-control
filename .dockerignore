@@ -1,0 +1,10 @@
+.git
+.gitignore
+logs
+docs
+assets
+__pycache__
+**/__pycache__
+*.pyc
+docker-compose.yml
+deploy
