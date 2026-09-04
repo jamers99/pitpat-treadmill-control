@@ -13,6 +13,20 @@ svc 0000fba0-…      ← vendor service (this variant, vs. ff00-family upstream
     0000fba1-…  read, write       ← commands
 ```
 
+Enumerate a device's own services/characteristics with:
+
+```python
+import asyncio
+from bleak import BleakClient
+async def m():
+    async with BleakClient("AA:BB:CC:DD:EE:FF") as c:
+        for s in c.services:
+            print("svc", s.uuid)
+            for ch in s.characteristics:
+                print("   ", ch.uuid, ch.properties)
+asyncio.run(m())
+```
+
 ## Deviations from upstream
 
 | | Upstream (BA04) | This variant |
@@ -39,6 +53,23 @@ Both changes are currently unconditional in `src/bluetooth_manager.py` —
 running this checkout against a BA04 unit will not work. Supporting both
 means probing for `fba0` vs. `ff00` at connect time and switching UUIDs/wrapper
 mode from that.
+
+### Adapting this for BA04 (or another variant)
+
+This checkout hardcodes the fba0 constants. To point it at a different
+device, hand a coding agent this file plus:
+
+1. `src/bluetooth_manager.py` — `NOTIFY_CHAR_UUID`, `WRITE_CHAR_UUID`,
+   `HEARTBEAT_PACKET`, and the `TreadmillData(data)` call in
+   `_notification_handler` (upstream needs `data[4:]`; add back the
+   `4d00 <counter> <length>` wrapper in `_write_data_and_set_request` /
+   `_write_heartbeat` if the target also needs it).
+2. Enumerate the device's GATT services/characteristics (§1 above shows the
+   `bleak` snippet) and diff against the tables in this doc to find what
+   actually differs.
+3. Confirm with the XOR checksum: a correctly-unwrapped status frame has
+   `checksum_valid = True`; a wrong offset or leftover wrapper byte flips it
+   to `False` immediately, so there's no guessing.
 
 ## Status frame (notify on `fba2`, 53 bytes, ~1/s, unprompted)
 

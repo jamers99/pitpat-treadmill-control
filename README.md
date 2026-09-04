@@ -24,6 +24,8 @@ A Dash-based web application to control and monitor a PitPat treadmill via Bluet
 - **Python 3.9+** (for local installation)
 - **Docker** (optional, for containerized deployment)
 - **Bluetooth-enabled device** with appropriate permissions
+- **Linux**, or Windows/macOS running the app natively (not in Docker) — see
+  [Windows / WSL2](#windows--wsl2) below
 
 ### Installation
 
@@ -179,6 +181,24 @@ Help us expand this list by reporting your compatible devices via an [issue](htt
 ### Logging
 - Logs are stored in the `logs/` directory (locally or within the container)
 - Rotating log files with a maximum size of 1MB and 5 backups
+
+### Windows / WSL2
+
+**Docker on Windows won't work as-is.** `bleak` on Linux talks to BLE only
+through `bluetoothd` over D-Bus, and WSL2's kernel has no Bluetooth stack
+against the Windows Bluetooth adapter by default — there's no
+`/run/dbus/system_bus_socket` to mount, so the container can neither scan nor
+connect. Getting BlueZ running inside WSL2 is possible (`usbipd-win` to pass
+the Bluetooth USB controller through, plus a WSL2 kernel built with Bluetooth
+support) but is unofficial and fragile — not something this project's Docker
+setup assumes.
+
+**Run it natively on Windows instead** (`pip install -r requirements.txt` and
+`python main.py`): `bleak` has a native Windows (WinRT) backend, so connect,
+notify and write should work. The BlueZ-specific extras — the "known devices"
+list in **Scan** and automatic stale-link release — quietly no-op outside
+Linux (falls back to a plain scan), so device discovery may need a manually
+typed address if a stale connection is holding the treadmill.
 
 ---
 
