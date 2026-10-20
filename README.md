@@ -15,11 +15,20 @@ pitpat 2.5      # connect to the last treadmill and start the belt at 2.5
 
 Needs **Python 3.10+** and a Bluetooth adapter. Works on Linux and Windows.
 
+The easiest way is [uv](https://docs.astral.sh/uv/), which installs `pitpat` into its
+own environment and puts the command on your PATH:
+
 ```bash
-git clone https://github.com/azmke/pitpat-treadmill-control.git
-cd pitpat-treadmill-control
-pip install .            # or: pipx install .
+uv tool install git+https://github.com/azmke/pitpat-treadmill-control.git
 ```
+
+Get uv with `pacman -S uv`, `brew install uv`, `winget install astral-sh.uv`, or
+[the installer](https://docs.astral.sh/uv/getting-started/installation/).
+`pipx install git+https://…` works the same way.
+
+From a clone, `uv tool install -e .` runs the checkout directly, so your edits
+take effect without reinstalling. To update, run `uv tool upgrade pitpat`; to
+remove, `uv tool uninstall pitpat`.
 
 Then run `pitpat` (or `python -m pitpat`).
 
@@ -88,8 +97,7 @@ or pull request.
 ## Development
 
 ```bash
-pip install -e '.[test]'
-pytest
+uv run --extra test pytest
 ```
 
 | File | What it does |
