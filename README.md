@@ -19,7 +19,7 @@ The easiest way is [uv](https://docs.astral.sh/uv/), which installs `pitpat` int
 own environment and puts the command on your PATH:
 
 ```bash
-uv tool install git+https://github.com/azmke/pitpat-treadmill-control.git
+uv tool install git+https://github.com/jamers99/pitpat-treadmill-control.git
 ```
 
 Get uv with `pacman -S uv`, `brew install uv`, `winget install astral-sh.uv`, or
@@ -80,7 +80,7 @@ You can edit `presets` in the config by hand. It holds up to nine speeds.
 - PitPat T01, firmware 37 (`fba0` variant). See [docs/FIRMWARE-VARIANT.md](docs/FIRMWARE-VARIANT.md)
 
 The variant is detected automatically when connecting. To report another
-working model, open an [issue](https://github.com/azmke/pitpat-treadmill-control/issues)
+working model, open an [issue](https://github.com/jamers99/pitpat-treadmill-control/issues)
 or pull request.
 
 ## Troubleshooting
