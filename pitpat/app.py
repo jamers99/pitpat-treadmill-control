@@ -1,6 +1,7 @@
 """The terminal UI."""
 import asyncio
 import logging
+import os
 import time
 from typing import Callable, Optional, Union
 
@@ -96,6 +97,7 @@ class DevicePicker(ModalScreen[Optional[str]]):
             devices_list.add_option(Option(f"{d.name}  [dim]{d.address}  {signal}[/]{saved}", id=d.address))
         status.update(f"Found {len(devices)}. Pick one with ↑↓ and Enter.")
         devices_list.display = True
+        devices_list.highlighted = 0
         devices_list.focus()
 
     @on(OptionList.OptionSelected, "#devices")
@@ -196,7 +198,9 @@ class Dashboard(Screen):
         variant = self.config.variant if address.upper() == (self.config.address or "").upper() else None
         self.connecting = True
         while True:
-            self.set_connection(f"[yellow]●[/] {'Reconnecting' if retry else 'Connecting'} to {address}…")
+            self.set_connection(
+                f"[yellow]●[/] {'Reconnecting' if retry else 'Connecting'} to {address}…  [dim](c to choose another)[/]"
+            )
             treadmill = self.make_treadmill(address, self.on_status, self.on_lost, variant)
             try:
                 await treadmill.connect()
@@ -369,6 +373,13 @@ class Dashboard(Screen):
         self.query_one("#details").toggle_class("shown")
 
     def action_pick_device(self, auto_pick: bool = False) -> None:
+        if self.connecting:
+            # Connecting scans for the device too, and BlueZ allows one scan at a time.
+            self.workers.cancel_group(self, "connection")
+            self.connecting = False
+            self.set_connection("[dim]●[/] Not connected")
+            self.refresh_view()
+
         def chosen(address: Optional[str]) -> None:
             if address:
                 self.connect(address)
@@ -465,12 +476,18 @@ class Dashboard(Screen):
         table.add_rows(rows)
 
 
+def terminal_is_light() -> bool:
+    """Best guess from COLORFGBG ("fg;bg"), which some terminals set; else dark."""
+    background = os.environ.get("COLORFGBG", "").split(";")[-1]
+    return background in ("7", "15")
+
+
 class PitPatApp(App):
     TITLE = "PitPat"
     ENABLE_COMMAND_PALETTE = False
     BINDINGS = [Binding("ctrl+c", "quit", show=False, priority=True)]
     CSS = """
-    #connection { padding: 0 1; background: $panel; }
+    #connection { padding: 0 1; border-bottom: solid ansi_bright_black; height: 2; }
     #main { align: center top; padding: 1 2; }
     #state { width: 100%; text-align: center; text-style: bold; color: $text-muted; }
     #state.running { color: $success; }
@@ -479,17 +496,18 @@ class PitPatApp(App):
     #speed { width: 100%; text-align: center; margin: 1 0 0 0; }
     #target { width: 100%; text-align: center; color: $text-muted; margin-bottom: 1; }
     #stats { height: auto; width: 100%; align-horizontal: center; }
-    .stat { width: 18; height: auto; border: round $panel-lighten-2; padding: 0 1; }
+    .stat { width: 18; height: auto; border: round ansi_bright_black; padding: 0 1; }
     .stat-title { color: $text-muted; }
     .stat-value { text-style: bold; }
     #presets { width: 100%; text-align: center; margin: 1 0; }
     #details { display: none; height: auto; max-height: 16; margin: 0 4; }
     #details.shown { display: block; }
     DevicePicker, SpeedPrompt { align: center middle; }
-    #picker { width: 80; max-width: 100%; height: auto; max-height: 90%; border: thick $primary; background: $surface; padding: 1 2; }
+    #picker { width: 80; max-width: 100%; height: auto; max-height: 90%; border: round $primary; background: $background; padding: 1 2; }
     #picker-title { text-style: bold; margin-bottom: 1; }
     #devices { height: auto; max-height: 12; margin: 1 0; }
-    #prompt { width: 44; height: auto; border: thick $primary; background: $surface; padding: 1 2; }
+    #devices > .option-list--option-highlighted { background: ansi_blue; color: ansi_bright_white; text-style: bold; }
+    #prompt { width: 44; height: auto; border: round $primary; background: $background; padding: 1 2; }
     """
 
     def __init__(self, config: Config, startup_speed: Optional[float] = None, make_treadmill: TreadmillFactory = ble.Treadmill):
@@ -497,6 +515,8 @@ class PitPatApp(App):
         self.dashboard = Dashboard(config, make_treadmill, startup_speed)
 
     def on_mount(self) -> None:
+        # Draw with the terminal's own background and palette rather than Textual's.
+        self.theme = "ansi-light" if terminal_is_light() else "ansi-dark"
         self.push_screen(self.dashboard)
 
     async def action_quit(self) -> None:

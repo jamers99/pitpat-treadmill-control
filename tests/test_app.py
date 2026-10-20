@@ -164,3 +164,25 @@ def test_config_tolerates_hand_edits(tmp_path):
     presets = Config.load().presets
     assert presets[:3] == [2.0, 3.0, 1.0] and len(presets) == 9
     assert all(isinstance(p, float) for p in presets)
+
+
+async def test_choosing_device_cancels_slow_connect(monkeypatch):
+    """Scanning while bleak is still looking for the old address fails in BlueZ."""
+    class SlowTreadmill(FakeTreadmill):
+        async def connect(self):
+            await asyncio.sleep(60)
+
+    scanned = []
+
+    async def discover():
+        scanned.append(app.dashboard.connecting)
+        return []
+
+    monkeypatch.setattr(ble, "discover", discover)
+    app = PitPatApp(Config(address="AA:BB"), make_treadmill=SlowTreadmill)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        assert app.dashboard.connecting
+        await pilot.press("c")
+        await pilot.pause()
+        assert scanned == [False]
