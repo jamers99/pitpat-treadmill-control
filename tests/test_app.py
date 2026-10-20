@@ -210,3 +210,28 @@ async def test_nudges_land_on_every_step_despite_treadmill_rounding():
                 t.feed(flags=IMPERIAL | RUNNING, target=target)
             assert app.dashboard.goal is None, f"stuck short of {1.5 + step / 10:.1f}"
             assert round(target / 1609.344, 1) == round(1.5 + step / 10, 1)
+
+
+async def test_steps_and_serial_survive_alternating_frames():
+    from test_protocol import FBA0_EXTENDED, FBA0_IDENTITY
+
+    app = PitPatApp(Config(address="AA:BB"), make_treadmill=FakeTreadmill)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        t = FakeTreadmill.instances[-1]
+        for frame_bytes in (FBA0_IDENTITY, FBA0_EXTENDED, FBA0_IDENTITY):
+            t.on_status(Status.parse(frame_bytes))
+        assert app.dashboard.status.steps == 1979
+        assert app.dashboard.status.serial == "tWgq19hgeqrAK141"
+        assert str(app.dashboard.query_one("#steps").render()) == "1,979"
+
+
+async def test_lone_step_glitch_ignored_but_reset_accepted():
+    app = PitPatApp(Config(address="AA:BB"), make_treadmill=FakeTreadmill)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        d = app.dashboard
+        seen = []
+        for steps in (1911, 2379, 1911, 1912, 0, 0, 1):
+            seen.append(d.filter_steps(steps, seen[-1] if seen else None))
+        assert seen == [1911, 1911, 1911, 1912, 1912, 0, 1]

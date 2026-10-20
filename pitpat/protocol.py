@@ -109,14 +109,14 @@ class Status:
     target_incline: int
     max_incline: int
     heart_rate: int
-    steps: int
+    steps: Optional[int]  # None when this frame doesn't carry it
     calories: int
     duration_s: float
     firmware: int
     device_type: int
     imperial: bool
     state: State
-    serial: Optional[str] = None
+    serial: Optional[str] = None  # Only in the occasional identity frame
 
     @classmethod
     def parse(cls, frame: bytes) -> Optional["Status"]:
@@ -134,13 +134,17 @@ class Status:
         flags = frame[26]
         state = {24: State.STARTING, 8: State.RUNNING, 16: State.PAUSED}.get(flags & 24, State.STOPPED)
         steps = u32(14)
-        # Frames 45-51 bytes long from newer firmware carry a more reliable
-        # motor-derived step count at offset 43.
-        if firmware >= 25 and 45 <= len(frame) < 52 and frame[1] > 44:
-            steps = u16(43)
         serial = None
-        if firmware >= 25 and len(frame) >= 52:
-            serial = frame[32:48].decode("ascii", errors="ignore").strip("\x00 ") or None
+        # Newer firmware sends two long frame kinds: an occasional identity frame
+        # with the serial at 32-47, and the regular extended frame with a
+        # motor-derived step count at 43-44 (bytes 14-17 then stay 0).
+        if firmware >= 25 and len(frame) >= 45 and frame[1] > 44:
+            ident = frame[32:48]
+            if len(frame) >= 52 and any(ident) and all(32 <= b < 127 or b == 0 for b in ident):
+                serial = ident.decode("ascii").strip("\x00 ") or None
+                steps = steps or None
+            else:
+                steps = u16(43)
         duration = u32(20)
 
         return cls(

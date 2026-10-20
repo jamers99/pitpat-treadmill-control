@@ -165,6 +165,7 @@ class Dashboard(Screen):
         self.resume_speed: Optional[float] = None
         self.saving_preset = False
         self.connecting = False
+        self.unconfirmed_steps: Optional[int] = None
 
     def compose(self) -> ComposeResult:
         yield Static("[dim]●[/] Not connected", id="connection")
@@ -253,11 +254,24 @@ class Dashboard(Screen):
         if self.status is None or status.target_speed != self.status.target_speed:
             log.info("Treadmill target now %d (%.2f %s)", status.target_speed,
                      status.to_display(status.target_speed), status.speed_unit)
+        if self.status:
+            # Frame kinds alternate, and not every kind carries these.
+            status.steps = self.filter_steps(status.steps, self.status.steps)
+            status.serial = status.serial or self.status.serial
         self.status = status
         if status.state == State.RUNNING and status.target_speed:
             self.resume_speed = status.to_display(status.target_speed)
         self.drive()
         self.refresh_view()
+
+    def filter_steps(self, new: Optional[int], old: Optional[int]) -> Optional[int]:
+        """Keeps the last count through frames without one, and ignores a lone
+        implausible reading (seen once as the belt starts) until a second agrees."""
+        if new is None or old is None or 0 <= new - old <= 20 or new == self.unconfirmed_steps:
+            self.unconfirmed_steps = None
+            return old if new is None else new
+        self.unconfirmed_steps = new
+        return old
 
     def set_goal(self, goal: Union[float, str, None]) -> None:
         self.goal = goal
@@ -446,7 +460,7 @@ class Dashboard(Screen):
             target.update(line)
             self.query_one("#time", Label).update(fmt_duration(s.duration_s))
             self.query_one("#distance", Label).update(f"{s.distance:.2f} {s.distance_unit}")
-            self.query_one("#steps", Label).update(f"{s.steps:,}")
+            self.query_one("#steps", Label).update("--" if s.steps is None else f"{s.steps:,}")
             self.query_one("#calories", Label).update(f"{s.calories} kcal")
 
         current = self.current_speed()

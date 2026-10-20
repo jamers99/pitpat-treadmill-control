@@ -75,3 +75,27 @@ def test_to_wire_clamps_to_max():
     assert s.to_wire(2.5) == 4023
     assert s.to_wire(10) == 6000
     assert s.to_wire(-1) == 0
+
+
+# Captured from a firmware-37 (fba0) treadmill mid-walk at 1.5 mph.
+FBA0_IDENTITY = bytes.fromhex(
+    "66350000000af00000052d00000000000000006d001a69bd8c259317700005027457677131396867657172414b3134310000007443"
+)
+FBA0_EXTENDED = bytes.fromhex(
+    "673c000960096000000562000000000000000072001badf08c258b17700005020000000000000000"
+    "3404cf07bb000006000000000000000000006843"
+)
+
+
+def test_fba0_extended_frame_has_steps_not_serial():
+    s = Status.parse(FBA0_EXTENDED)
+    assert s.steps == 1979
+    assert s.serial is None
+    assert s.state == State.RUNNING and s.imperial
+    assert round(s.to_display(s.speed), 1) == 1.5
+
+
+def test_fba0_identity_frame_has_serial_not_steps():
+    s = Status.parse(FBA0_IDENTITY)
+    assert s.serial == "tWgq19hgeqrAK141"
+    assert s.steps is None
