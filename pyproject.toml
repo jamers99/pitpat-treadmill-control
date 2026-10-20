@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pitpat"
+version = "2.0.0"
+description = "Control a PitPat treadmill over Bluetooth from the terminal"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "bleak>=1.0,<4",
+    "textual>=1.0,<9",
+    # Talks to BlueZ directly to clear stale links; Linux only.
+    "dbus-fast>=2.0; sys_platform == 'linux'",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+pitpat = "pitpat.__main__:main"
+
+[tool.setuptools]
+packages = ["pitpat"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
