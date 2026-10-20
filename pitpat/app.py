@@ -160,6 +160,8 @@ class Dashboard(Screen):
         self.goal: Union[float, str, None] = startup_speed
         self.goal_deadline: Optional[float] = None
         self.last_sent: tuple[bytes, float] = (b"", 0.0)
+        # The speed last sent for the current goal.
+        self.sent_wire: Optional[int] = None
         self.resume_speed: Optional[float] = None
         self.saving_preset = False
         self.connecting = False
@@ -248,6 +250,9 @@ class Dashboard(Screen):
     # --- Driving the treadmill ----------------------------------------------
 
     def on_status(self, status: Status) -> None:
+        if self.status is None or status.target_speed != self.status.target_speed:
+            log.info("Treadmill target now %d (%.2f %s)", status.target_speed,
+                     status.to_display(status.target_speed), status.speed_unit)
         self.status = status
         if status.state == State.RUNNING and status.target_speed:
             self.resume_speed = status.to_display(status.target_speed)
@@ -258,6 +263,7 @@ class Dashboard(Screen):
         self.goal = goal
         self.goal_deadline = None
         self.last_sent = (b"", 0.0)
+        self.sent_wire = None
         self.drive()
         self.refresh_view()
 
@@ -292,14 +298,24 @@ class Dashboard(Screen):
                 self.goal = None
             return
 
-        wire = s.to_wire(self.goal)
+        wanted = s.to_wire(self.goal)
         if s.state in (State.PAUSED, State.STOPPED):
-            self.send(protocol.start(wire, s.imperial))
+            self.send(protocol.start(wanted, s.imperial))
         elif s.state == State.RUNNING:
-            if round(s.to_display(s.target_speed), 1) == round(s.to_display(wire), 1):
+            if round(s.to_display(s.target_speed), 1) == round(s.to_display(wanted), 1):
                 self.goal = None
+                return
+            if self.sent_wire is None:
+                wire = wanted
+            elif time.monotonic() - self.last_sent[1] >= RESEND_AFTER:
+                # The treadmill rounds to its own 0.1 steps and some values land
+                # on the step below, so aim off by half the miss and try again.
+                wire = self.sent_wire + (wanted - s.target_speed) // 2
+                wire = max(0, min(wire, s.max_speed or 0xFFFF))
             else:
-                self.send(protocol.set_speed(wire, s.imperial))
+                wire = self.sent_wire  # Give it time to act first.
+            self.sent_wire = wire
+            self.send(protocol.set_speed(wire, s.imperial))
 
     def require_status(self) -> Optional[Status]:
         if self.status is None:

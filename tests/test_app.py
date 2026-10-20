@@ -186,3 +186,27 @@ async def test_choosing_device_cancels_slow_connect(monkeypatch):
         await pilot.press("c")
         await pilot.pause()
         assert scanned == [False]
+
+
+async def test_nudges_land_on_every_step_despite_treadmill_rounding():
+    """A treadmill that truncates to 0.1 mph via a sloppy conversion (as the
+    real one seems to, refusing 1.8) still reaches each step after correction."""
+
+    def treadmill_target(sent):
+        mph = int(sent / 1610 * 10) / 10
+        return round(mph * protocol.KM_PER_MILE * 1000)
+
+    app = PitPatApp(Config(address="AA:BB"), make_treadmill=FakeTreadmill)
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        t = FakeTreadmill.instances[-1]
+        target = wire(1.5)
+        t.feed(flags=IMPERIAL | RUNNING, target=target)
+        for step in range(1, 15):
+            await pilot.press("up")
+            for _ in range(5):
+                if t.sent and t.sent[-1][12] & 7 == protocol.Command.START_OR_SET:
+                    target = treadmill_target(int.from_bytes(t.sent[-1][6:8], "big"))
+                t.feed(flags=IMPERIAL | RUNNING, target=target)
+            assert app.dashboard.goal is None, f"stuck short of {1.5 + step / 10:.1f}"
+            assert round(target / 1609.344, 1) == round(1.5 + step / 10, 1)
